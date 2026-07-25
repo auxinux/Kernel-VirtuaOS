@@ -62,8 +62,8 @@ Environment options:
       Default: 3. Use 0 to keep everything.
 
   ZFS_META_DEP=depends|recommends|none
-      How kernel meta-packages reference matching OpenZFS module packages.
-      Default: recommends.
+      How kernel meta-packages reference the OpenZFS DKMS source package
+      (openzfs-zfs-dkms). Default: recommends.
 
   ARCHES="amd64"
       Fixed Debian package architecture for this repository.
@@ -347,23 +347,32 @@ generate_meta_package() {
     echo "  AVERTISSEMENT: headers absents pour ${kernel_release}; meta image seulement."
   fi
 
-  # Modules OpenZFS appariés si présents dans le dépôt. Par défaut on les met
-  # en Recommends: le paquet kernel reste configurable même si ZFS échoue.
+  # Paquet source OpenZFS (DKMS, modèle Debian) si présent dans le dépôt. Le
+  # nom du paquet est FIXE (openzfs-zfs-dkms, arch=all): contrairement à
+  # l'ancien module précompilé (kmod-zfs-<release>), il n'est pas apparié à un
+  # kernel précis par son nom — DKMS le recompile pour n'importe quel kernel
+  # installé, à condition d'avoir les headers correspondants au moment de
+  # l'install.
   local zfs_pkg zfs_version
   zfs_pkg="$(
     for f in "$KERNEL_DIR"/*.deb; do
       [[ -e "$f" ]] || continue
       pkg="$(dpkg-deb -f "$f" Package)"
       pkg_arch="$(dpkg-deb -f "$f" Architecture)"
-      [[ "$pkg_arch" == "$deb_arch" || "$pkg_arch" == "all" ]] || continue
-      case "$pkg" in
-        # native-deb-kmod -> openzfs-zfs-modules-<release> ; alien -> kmod-zfs-<release>
-        kmod-zfs-"${kernel_release}"|zfs-modules-"${kernel_release}"|*zfs-modules-"${kernel_release}")
-          echo "$pkg"; break ;;
-      esac
+      [[ "$pkg" == "openzfs-zfs-dkms" && "$pkg_arch" == "all" ]] || continue
+      echo "$pkg"; break
     done
   )"
   if [[ -n "$zfs_pkg" ]]; then
+    # DKMS échoue SILENCIEUSEMENT à l'installation si les headers du kernel
+    # cible sont absents du dépôt (le module ne se (re)compile juste jamais,
+    # sans erreur bloquante visible). On refuse donc de publier ce meta dans
+    # cette situation, plutôt qu'un simple avertissement.
+    [[ -n "$header_version" ]] \
+      || die "openzfs-zfs-dkms présent dans ${KERNEL_DIR} mais ${header_pkg} absent.
+DKMS ne pourra pas compiler le module ZFS à l'installation sans ces headers.
+Ajoute ${header_pkg} au dépôt, ou retire openzfs-zfs-dkms de ${KERNEL_DIR}."
+
     zfs_version="$(
       for f in "$KERNEL_DIR"/*.deb; do
         [[ -e "$f" ]] || continue
@@ -374,14 +383,14 @@ generate_meta_package() {
     case "$ZFS_META_DEP" in
       depends)
         deps="${deps}, ${zfs_pkg} (= ${zfs_version})"
-        echo "  + ZFS apparié en Depends: ${zfs_pkg} (${zfs_version})"
+        echo "  + OpenZFS DKMS en Depends: ${zfs_pkg} (${zfs_version})"
         ;;
       recommends)
         recommends="${zfs_pkg} (= ${zfs_version})"
-        echo "  + ZFS apparié en Recommends: ${zfs_pkg} (${zfs_version})"
+        echo "  + OpenZFS DKMS en Recommends: ${zfs_pkg} (${zfs_version})"
         ;;
       none)
-        echo "  + ZFS apparié détecté mais ignoré par le meta: ${zfs_pkg} (${zfs_version})"
+        echo "  + OpenZFS DKMS détecté mais ignoré par le meta: ${zfs_pkg} (${zfs_version})"
         ;;
       *)
         die "ZFS_META_DEP invalide: ${ZFS_META_DEP}. Valeurs: depends, recommends, none."
