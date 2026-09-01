@@ -64,7 +64,7 @@ names, build directories, package directories and APT suites:
 | Track | Kernel release | Meta package | APT suite | Repo directory |
 |---|---|---|---|---|
 | `prod` | `X.Y.Z-auxinux-virtua-amd64` | `kernel-virtua` | `kernel` | `KERNEL/` |
-| `dev` | `X.Y.Z-DEV-auxinux-virtua-amd64` | `kernel-virtua-dev` | `kernel-dev` | `KERNEL-DEV/` |
+| `dev` | `X.Y.Z-dev-auxinux-virtua-amd64` | `kernel-virtua-dev` | `kernel-dev` | `KERNEL-DEV/` |
 
 A production host enables only the `kernel` suite, so it can never be offered a
 DEV kernel — the two channels do not share a package name.

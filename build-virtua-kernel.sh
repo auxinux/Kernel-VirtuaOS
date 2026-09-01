@@ -24,7 +24,7 @@ die() { echo; echo "ERREUR: $*" >&2; exit 1; }
 #
 #   RELEASE_TRACK       : "prod" ou "dev" (defaut: prod)
 #                         prod -> X.Y.Z-auxinux-virtua-amd64      / kernel-virtua
-#                         dev  -> X.Y.Z-DEV-auxinux-virtua-amd64  / kernel-virtua-dev
+#                         dev  -> X.Y.Z-dev-auxinux-virtua-amd64  / kernel-virtua-dev
 #   SOURCE              : "kernelorg" ou "debian" (defaut: kernelorg)
 #   PROFILE             : "virtua", "desktop" ou "auxinuxos" (defaut: virtua)
 #   TARGET_ARCH         : "amd64", "arm" ou "arm64" (defaut: amd64)
@@ -55,8 +55,11 @@ RELEASE_BRANCH="${RELEASE_BRANCH:-}"
 # --- Canal de publication (track) : prod ou dev ---------------------------
 # NE PAS confondre avec RELEASE_CHANNEL (current/lts/mainline) qui sélectionne
 # la série kernel.org. RELEASE_TRACK sélectionne le canal de PUBLICATION :
-#   prod -> 7.1.12-auxinux-virtua-amd64      (paquet meta kernel-virtua)
-#   dev  -> 7.2.2-DEV-auxinux-virtua-amd64   (paquet meta kernel-virtua-dev)
+#   prod -> 7.1.12-auxinux-virtua-amd64       (paquet meta kernel-virtua)
+#   dev  -> 7.2.2-dev-auxinux-virtua-amd64    (paquet meta kernel-virtua-dev)
+# Le marqueur 'dev' est en minuscules: la policy Debian interdit les majuscules
+# dans un nom de paquet, et le nom du paquet noyau est dérivé du release
+# (mkdebian écrit "Package: linux-image-${KERNELRELEASE}" tel quel).
 # Les deux canaux ont des suffixes, des dossiers de build et des suites APT
 # distincts : un kernel DEV ne peut jamais être servi aux hôtes de production.
 RELEASE_TRACK="${RELEASE_TRACK:-prod}"
@@ -134,7 +137,7 @@ Publication track (prod / dev):
       This is the default.
 
   track=dev
-      Test/development kernel. Release: X.Y.Z-DEV-auxinux-virtua-amd64
+      Test/development kernel. Release: X.Y.Z-dev-auxinux-virtua-amd64
       Meta-package: kernel-virtua-dev, published in APT suite 'kernel-dev'.
       Separate build root, output directory, package names and APT suite, so a
       dev kernel can never reach a production host through the prod suite.
@@ -214,7 +217,7 @@ OpenZFS en paquet source DKMS (modèle Debian, CDDL/GPL séparées):
 Examples:
   $0
   $0 KERNEL_VERSION=7.1.12                      # prod  -> 7.1.12-auxinux-virtua-amd64
-  $0 track=dev KERNEL_VERSION=7.2.2             # dev   -> 7.2.2-DEV-auxinux-virtua-amd64
+  $0 track=dev KERNEL_VERSION=7.2.2             # dev   -> 7.2.2-dev-auxinux-virtua-amd64
   $0 --channel=current --branch=7.0
   $0 --channel=lts --branch=6.18
   $0 KERNEL_VERSION=6.12.31
@@ -413,7 +416,7 @@ case "$RELEASE_TRACK" in
 esac
 
 if [[ "$RELEASE_TRACK" == "dev" ]]; then
-  TRACK_FLAVOUR="DEV-auxinux-virtua"
+  TRACK_FLAVOUR="dev-auxinux-virtua"
   TRACK_META="kernel-virtua-dev"
   TRACK_SUITE="kernel-dev"
   TRACK_BUILD_SUFFIX="-dev"
@@ -568,6 +571,18 @@ if [[ -z "$KERNEL_FLAVOUR" ]]; then
 fi
 
 KERNEL_NAME_SUFFIX="${KERNEL_FLAVOUR}-${KERNEL_ARCH_SUFFIX}"
+
+# Le nom du paquet noyau est dérivé du release: scripts/package/mkdebian écrit
+# "Package: linux-image-${KERNELRELEASE}" sans normaliser. dpkg-gencontrol
+# refuse alors tout caractère hors [a-z0-9+.-] ("illegal package name"), mais
+# seulement à l'étape d'empaquetage — c'est-à-dire APRÈS la compilation
+# complète. On valide donc ici, en une seconde, plutôt qu'après 40 minutes.
+if [[ ! "$KERNEL_NAME_SUFFIX" =~ ^[a-z0-9][a-z0-9+.-]*$ ]]; then
+  die "suffixe de kernel invalide pour un nom de paquet Debian: '${KERNEL_NAME_SUFFIX}'.
+Un nom de paquet ne peut contenir que [a-z0-9+.-] et commencer par [a-z0-9]
+(policy Debian 5.6.1). Les MAJUSCULES sont notamment interdites: utilise
+'dev-auxinux-virtua' et non 'DEV-auxinux-virtua'."
+fi
 
 if [[ -z "$META_PACKAGE" ]]; then
   case "$PROFILE" in

@@ -11,6 +11,7 @@ set -Eeuo pipefail
 #   RELEASE_TRACK  : "prod" ou "dev" (defaut: prod)
 #                    prod -> suite 'kernel'     KERNEL/     kernel-virtua
 #                    dev  -> suite 'kernel-dev' KERNEL-DEV/ kernel-virtua-dev
+#                            saveur dev-auxinux-virtua (minuscules: policy Debian)
 #   REPO_ROOT      : racine du depot (defaut: /var/www/dep.auxinux.ca/VIRTUA)
 #   KERNEL_DIR     : dossier des .deb (defaut: REPO_ROOT/<KERNEL|KERNEL-DEV>)
 #   SIGN           : 1 = signe le depot avec GPG, 0 = trusted=yes (defaut: 1)
@@ -18,7 +19,7 @@ set -Eeuo pipefail
 #   KEEP_VERSIONS  : nb de versions a garder par paquet, 0 = tout garder (defaut: 3)
 #   ZFS_META_DEP    : depends, recommends ou none (defaut: recommends)
 #   ARCHES         : architecture APT publiee (fixe: "amd64")
-#   KERNEL_FLAVOUR : suffixe fixe par track (auxinux-virtua / DEV-auxinux-virtua)
+#   KERNEL_FLAVOUR : suffixe fixe par track (auxinux-virtua / dev-auxinux-virtua)
 #   META_PACKAGE   : paquet meta fixe par track (kernel-virtua / kernel-virtua-dev)
 #   STRICT_EXISTING: 1 = un paquet hors-track deja present devient bloquant
 #   DEPLOY=1       : copie le dépôt final vers DEPLOY_TARGET (optionnel)
@@ -49,7 +50,7 @@ Publication track (prod / dev):
 
   RELEASE_TRACK=dev
       APT suite 'kernel-dev', packages in REPO_ROOT/KERNEL-DEV,
-      flavour DEV-auxinux-virtua, meta-package kernel-virtua-dev.
+      flavour dev-auxinux-virtua, meta-package kernel-virtua-dev.
 
   Both tracks live in the same repository root and share the same signing key,
   but have separate suites, directories and package names. A production host
@@ -142,7 +143,7 @@ fi
 # se voir proposer un noyau DEV.
 #
 #   prod -> suite 'kernel'      KERNEL/      auxinux-virtua      kernel-virtua
-#   dev  -> suite 'kernel-dev'  KERNEL-DEV/  DEV-auxinux-virtua  kernel-virtua-dev
+#   dev  -> suite 'kernel-dev'  KERNEL-DEV/  dev-auxinux-virtua  kernel-virtua-dev
 RELEASE_TRACK="${RELEASE_TRACK:-prod}"
 case "$RELEASE_TRACK" in
   prod|production|stable) RELEASE_TRACK="prod" ;;
@@ -153,7 +154,7 @@ esac
 if [[ "$RELEASE_TRACK" == "dev" ]]; then
   TRACK_SUITE="kernel-dev"
   TRACK_DIRNAME="KERNEL-DEV"
-  TRACK_FLAVOUR="DEV-auxinux-virtua"
+  TRACK_FLAVOUR="dev-auxinux-virtua"
   TRACK_META="kernel-virtua-dev"
   # Un paquet de production n'a rien à faire dans le canal dev.
   TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop"
@@ -162,10 +163,10 @@ else
   TRACK_DIRNAME="KERNEL"
   TRACK_FLAVOUR="auxinux-virtua"
   TRACK_META="kernel-virtua"
-  # 'DEV-auxinux-virtua' doit être explicitement banni du canal prod: le motif
+  # 'dev-auxinux-virtua' doit être explicitement banni du canal prod: le motif
   # de recherche du meta (linux-image-*-auxinux-virtua-*) matcherait sinon un
   # noyau DEV, et le paquet kernel-virtua pointerait dessus.
-  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop DEV-auxinux-virtua kernel-virtua-dev"
+  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop dev-auxinux-virtua kernel-virtua-dev"
 fi
 
 REPO_ROOT="${REPO_ROOT:-/var/www/dep.auxinux.ca/VIRTUA}"
@@ -352,7 +353,7 @@ echo "[2/9] Purge des anciennes versions..."
 # KEEP_VERSIONS. C'est pourquoi le dépôt accumulait 7.1.1, 7.1.3, 7.1.10...
 #
 #   linux-image-7.1.10-auxinux-virtua-amd64      -> linux-image::auxinux-virtua-amd64      (7.1.10)
-#   linux-image-7.2.2-DEV-auxinux-virtua-amd64   -> linux-image::DEV-auxinux-virtua-amd64  (7.2.2)
+#   linux-image-7.2.2-dev-auxinux-virtua-amd64   -> linux-image::dev-auxinux-virtua-amd64  (7.2.2)
 #   kernel-virtua                                -> kernel-virtua        (version du paquet)
 #
 # Les noyaux DEV et prod tombent donc dans des familles distinctes et ne se
@@ -434,11 +435,11 @@ generate_meta_package() {
         linux-image-*-"${kernel_flavour}"-*-dbg) ;;
         linux-image-*-"${kernel_flavour}"-*-dbgsym) ;;
         # Sur le track prod, kernel_flavour vaut 'auxinux-virtua' et le motif
-        # générique ci-dessous matcherait AUSSI un noyau DEV nommé
-        # linux-image-7.2.2-DEV-auxinux-virtua-amd64 (le '*' couvre 'DEV').
+        # générique ci-dessous matcherait AUSSI un noyau dev nommé
+        # linux-image-7.2.2-dev-auxinux-virtua-amd64 (le '*' couvre '7.2.2-dev').
         # kernel-virtua pointerait alors sur un noyau de test. On l'exclut.
-        # Sur le track dev ce motif ne matche rien (DEV-DEV-...), donc inoffensif.
-        linux-image-*-DEV-"${kernel_flavour}"-*) ;;
+        # Sur le track dev ce motif ne matche rien (dev-dev-...), donc inoffensif.
+        linux-image-*-dev-"${kernel_flavour}"-*) ;;
         linux-image-*-"${kernel_flavour}"-*)
           printf '%s\t%s\t%s\n' "$version" "$pkg" "$f"
           ;;
