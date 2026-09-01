@@ -157,7 +157,7 @@ if [[ "$RELEASE_TRACK" == "dev" ]]; then
   TRACK_FLAVOUR="dev-auxinux-virtua"
   TRACK_META="kernel-virtua-dev"
   # Un paquet de production n'a rien à faire dans le canal dev.
-  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop"
+  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop openzfs-zfs-modules kmod-zfs"
 else
   TRACK_SUITE="kernel"
   TRACK_DIRNAME="KERNEL"
@@ -166,7 +166,7 @@ else
   # 'dev-auxinux-virtua' doit être explicitement banni du canal prod: le motif
   # de recherche du meta (linux-image-*-auxinux-virtua-*) matcherait sinon un
   # noyau DEV, et le paquet kernel-virtua pointerait dessus.
-  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop dev-auxinux-virtua kernel-virtua-dev"
+  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop dev-auxinux-virtua kernel-virtua-dev openzfs-zfs-modules kmod-zfs"
 fi
 
 REPO_ROOT="${REPO_ROOT:-/var/www/dep.auxinux.ca/VIRTUA}"
@@ -188,6 +188,13 @@ SIGN="${SIGN:-1}"
 GPG_KEY="${GPG_KEY:-}"
 KEEP_VERSIONS="${KEEP_VERSIONS:-3}"
 ZFS_META_DEP="${ZFS_META_DEP:-recommends}"
+# 'openzfs-zfs-modules-<release>' et 'kmod-zfs-<release>' sont les anciens
+# modules ZFS PRÉCOMPILÉS. Les publier reviendrait à distribuer un binaire
+# combinant du code GPL-2.0 (Linux) et CDDL (OpenZFS) — précisément ce que ce
+# projet a cessé de faire en passant au paquet source DKMS. Le dossier de
+# sortie du builder étant cumulatif entre profils et entre versions, ces
+# paquets d'anciens builds y traînent encore et seraient réimportés sans ce
+# garde-fou.
 FORBIDDEN_PACKAGE_PATTERNS="${FORBIDDEN_PACKAGE_PATTERNS:-$TRACK_FORBIDDEN_DEFAULT}"
 
 # Le script tourne en root (sudo), mais la clé GPG vit en général dans le
