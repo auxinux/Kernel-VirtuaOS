@@ -8,15 +8,19 @@ set -Eeuo pipefail
 #   sudo ./build-depot-kernel.sh [IMPORT_DIR]
 #
 # Variables optionnelles:
+#   RELEASE_TRACK  : "prod" ou "dev" (defaut: prod)
+#                    prod -> suite 'kernel'     KERNEL/     kernel-virtua
+#                    dev  -> suite 'kernel-dev' KERNEL-DEV/ kernel-virtua-dev
 #   REPO_ROOT      : racine du depot (defaut: /var/www/dep.auxinux.ca/VIRTUA)
-#   KERNEL_DIR     : dossier des .deb (defaut: REPO_ROOT/KERNEL)
+#   KERNEL_DIR     : dossier des .deb (defaut: REPO_ROOT/<KERNEL|KERNEL-DEV>)
 #   SIGN           : 1 = signe le depot avec GPG, 0 = trusted=yes (defaut: 1)
 #   GPG_KEY        : id/email de la cle de signature (requis si SIGN=1)
 #   KEEP_VERSIONS  : nb de versions a garder par paquet, 0 = tout garder (defaut: 3)
 #   ZFS_META_DEP    : depends, recommends ou none (defaut: recommends)
 #   ARCHES         : architecture APT publiee (fixe: "amd64")
-#   KERNEL_FLAVOUR : suffixe fixe: auxinux-virtua
-#   META_PACKAGE   : paquet meta fixe: kernel-virtua
+#   KERNEL_FLAVOUR : suffixe fixe par track (auxinux-virtua / DEV-auxinux-virtua)
+#   META_PACKAGE   : paquet meta fixe par track (kernel-virtua / kernel-virtua-dev)
+#   STRICT_EXISTING: 1 = un paquet hors-track deja present devient bloquant
 #   DEPLOY=1       : copie le dépôt final vers DEPLOY_TARGET (optionnel)
 #   DEPLOY_TARGET  : cible locale ou rsync distante pour la publication
 #                    genere uniquement auxinux-virtua -> kernel-virtua [amd64]
@@ -38,9 +42,24 @@ Arguments:
       Directory containing .deb files to import into the repository.
       If omitted, KERNEL_DIR is used and no import copy is performed.
 
+Publication track (prod / dev):
+  RELEASE_TRACK=prod   (default)
+      APT suite 'kernel', packages in REPO_ROOT/KERNEL,
+      flavour auxinux-virtua, meta-package kernel-virtua.
+
+  RELEASE_TRACK=dev
+      APT suite 'kernel-dev', packages in REPO_ROOT/KERNEL-DEV,
+      flavour DEV-auxinux-virtua, meta-package kernel-virtua-dev.
+
+  Both tracks live in the same repository root and share the same signing key,
+  but have separate suites, directories and package names. A production host
+  that only enables the 'kernel' suite can never be offered a DEV kernel.
+
 Default repository layout:
-  REPO_ROOT/dists/kernel/main/binary-amd64/Packages
+  REPO_ROOT/dists/kernel/main/binary-amd64/Packages       (prod)
   REPO_ROOT/KERNEL/*.deb
+  REPO_ROOT/dists/kernel-dev/main/binary-amd64/Packages   (dev)
+  REPO_ROOT/KERNEL-DEV/*.deb
 
 Environment options:
   REPO_ROOT=/path
@@ -48,7 +67,7 @@ Environment options:
 
   KERNEL_DIR=/path
       Directory that stores kernel .deb packages.
-      Default: REPO_ROOT/KERNEL
+      Default: REPO_ROOT/KERNEL (prod) or REPO_ROOT/KERNEL-DEV (dev)
 
   SIGN=1|0
       Sign Release/InRelease with GPG. Default: 1.
@@ -58,8 +77,12 @@ Environment options:
       GPG signing key used when SIGN=1.
 
   KEEP_VERSIONS=n
-      Number of versions to keep per package name.
+      Number of kernel releases to keep per package family. Kernel packages
+      embed their version in the package NAME, so grouping is done on the
+      family (linux-image::auxinux-virtua-amd64) rather than the exact name.
       Default: 3. Use 0 to keep everything.
+      WARNING: this deletes already-published .deb files. Use KEEP_VERSIONS=0
+      when publishing a release, and run the purge as a deliberate operation.
 
   ZFS_META_DEP=depends|recommends|none
       How kernel meta-packages reference the OpenZFS DKMS source package
@@ -75,18 +98,26 @@ Environment options:
 Examples:
   sudo GPG_KEY='repo@auxinux.ca' $0 /tmp/virtua-kernel
 
+  sudo RELEASE_TRACK=dev GPG_KEY='repo@auxinux.ca' $0 /tmp/virtua-kernel-dev
+
   sudo SIGN=0 $0 .
 
 Client setup for a signed repository:
   sudo wget -O /usr/share/keyrings/virtua-archive-keyring.gpg \\
     https://dep.auxinux.ca/VIRTUA/virtua-archive-keyring.gpg
 
+  # Production
   echo 'deb [signed-by=/usr/share/keyrings/virtua-archive-keyring.gpg arch=amd64] https://dep.auxinux.ca/VIRTUA kernel main' \\
-    | sudo tee /etc/apt/sources.list.d/virtua-kernel.list
+    | sudo tee /etc/apt/sources.list.d/virtua-kernel-prod.list
+
+  # Test / DEV (machines de test uniquement)
+  echo 'deb [signed-by=/usr/share/keyrings/virtua-archive-keyring.gpg arch=amd64] https://dep.auxinux.ca/VIRTUA kernel-dev main' \\
+    | sudo tee /etc/apt/sources.list.d/virtua-kernel-dev.list
 
 Client install examples:
   sudo apt update
-  sudo apt install kernel-virtua
+  sudo apt install kernel-virtua        # production
+  sudo apt install kernel-virtua-dev    # test
 EOF
 }
 
@@ -102,18 +133,53 @@ if (( $# > 1 )); then
   exit 1
 fi
 
+# ============================================================
+# Track de publication: prod / dev
+# ============================================================
+# Deux canaux indépendants dans le MÊME dépôt, mais avec des suites APT, des
+# dossiers de paquets, des saveurs de kernel et des paquets meta distincts.
+# Un hôte de production n'active que la suite 'kernel' et ne peut donc jamais
+# se voir proposer un noyau DEV.
+#
+#   prod -> suite 'kernel'      KERNEL/      auxinux-virtua      kernel-virtua
+#   dev  -> suite 'kernel-dev'  KERNEL-DEV/  DEV-auxinux-virtua  kernel-virtua-dev
+RELEASE_TRACK="${RELEASE_TRACK:-prod}"
+case "$RELEASE_TRACK" in
+  prod|production|stable) RELEASE_TRACK="prod" ;;
+  dev|devel|test|testing) RELEASE_TRACK="dev" ;;
+  *) echo "ERROR: RELEASE_TRACK invalide: ${RELEASE_TRACK}. Valeurs: prod, dev." >&2; exit 1 ;;
+esac
+
+if [[ "$RELEASE_TRACK" == "dev" ]]; then
+  TRACK_SUITE="kernel-dev"
+  TRACK_DIRNAME="KERNEL-DEV"
+  TRACK_FLAVOUR="DEV-auxinux-virtua"
+  TRACK_META="kernel-virtua-dev"
+  # Un paquet de production n'a rien à faire dans le canal dev.
+  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop"
+else
+  TRACK_SUITE="kernel"
+  TRACK_DIRNAME="KERNEL"
+  TRACK_FLAVOUR="auxinux-virtua"
+  TRACK_META="kernel-virtua"
+  # 'DEV-auxinux-virtua' doit être explicitement banni du canal prod: le motif
+  # de recherche du meta (linux-image-*-auxinux-virtua-*) matcherait sinon un
+  # noyau DEV, et le paquet kernel-virtua pointerait dessus.
+  TRACK_FORBIDDEN_DEFAULT="auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop DEV-auxinux-virtua kernel-virtua-dev"
+fi
+
 REPO_ROOT="${REPO_ROOT:-/var/www/dep.auxinux.ca/VIRTUA}"
-KERNEL_DIR="${KERNEL_DIR:-${REPO_ROOT}/KERNEL}"
+KERNEL_DIR="${KERNEL_DIR:-${REPO_ROOT}/${TRACK_DIRNAME}}"
 REPO_LABEL="${REPO_LABEL:-Virtua Kernel Repository}"
 REPO_DESCRIPTION="${REPO_DESCRIPTION:-Virtua Custom Kernel Repository}"
 PUBLIC_REPO_URL="${PUBLIC_REPO_URL:-https://dep.auxinux.ca/VIRTUA}"
 KEYRING_BASENAME="${KEYRING_BASENAME:-virtua-archive-keyring}"
-SOURCES_LIST_NAME="${SOURCES_LIST_NAME:-virtua-kernel}"
+SOURCES_LIST_NAME="${SOURCES_LIST_NAME:-virtua-kernel-${RELEASE_TRACK}}"
 IMPORT_DIR="${1:-$KERNEL_DIR}"
 DEPLOY="${DEPLOY:-0}"
 DEPLOY_TARGET="${DEPLOY_TARGET:-}"
 
-DIST="kernel"
+DIST="$TRACK_SUITE"
 COMPONENT="main"
 ARCHES="${ARCHES:-amd64}"
 
@@ -121,7 +187,7 @@ SIGN="${SIGN:-1}"
 GPG_KEY="${GPG_KEY:-}"
 KEEP_VERSIONS="${KEEP_VERSIONS:-3}"
 ZFS_META_DEP="${ZFS_META_DEP:-recommends}"
-FORBIDDEN_PACKAGE_PATTERNS="${FORBIDDEN_PACKAGE_PATTERNS:-auxinuxos auxinux-desktop kernel-auxinuxos kernel-auxinux-desktop}"
+FORBIDDEN_PACKAGE_PATTERNS="${FORBIDDEN_PACKAGE_PATTERNS:-$TRACK_FORBIDDEN_DEFAULT}"
 
 # Le script tourne en root (sudo), mais la clé GPG vit en général dans le
 # trousseau de l'utilisateur qui a lancé sudo, pas dans /root/.gnupg.
@@ -131,15 +197,15 @@ if [[ -z "${GNUPGHOME:-}" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]];
   [[ -n "$_sudo_home" && -d "$_sudo_home/.gnupg" ]] && GNUPGHOME="$_sudo_home/.gnupg"
 fi
 [[ -n "${GNUPGHOME:-}" ]] && export GNUPGHOME
-KERNEL_FLAVOUR="${KERNEL_FLAVOUR:-auxinux-virtua}"
-META_PACKAGE="${META_PACKAGE:-kernel-virtua}"
-[[ "$KERNEL_FLAVOUR" == "auxinux-virtua" ]] \
-  || { echo "ERROR: Kernel/VirtuaOS only accepts KERNEL_FLAVOUR=auxinux-virtua." >&2; exit 1; }
-[[ "$META_PACKAGE" == "kernel-virtua" ]] \
-  || { echo "ERROR: Kernel/VirtuaOS only accepts META_PACKAGE=kernel-virtua." >&2; exit 1; }
+KERNEL_FLAVOUR="${KERNEL_FLAVOUR:-$TRACK_FLAVOUR}"
+META_PACKAGE="${META_PACKAGE:-$TRACK_META}"
+[[ "$KERNEL_FLAVOUR" == "$TRACK_FLAVOUR" ]] \
+  || { echo "ERROR: track ${RELEASE_TRACK} only accepts KERNEL_FLAVOUR=${TRACK_FLAVOUR}." >&2; exit 1; }
+[[ "$META_PACKAGE" == "$TRACK_META" ]] \
+  || { echo "ERROR: track ${RELEASE_TRACK} only accepts META_PACKAGE=${TRACK_META}." >&2; exit 1; }
 [[ "$ARCHES" == "amd64" ]] \
   || { echo "ERROR: Kernel/VirtuaOS currently publishes amd64 only." >&2; exit 1; }
-META_PROFILES=("auxinux-virtua:kernel-virtua:amd64")
+META_PROFILES=("${TRACK_FLAVOUR}:${TRACK_META}:amd64")
 
 KEYRING_ASC="${REPO_ROOT}/${KEYRING_BASENAME}.asc"
 KEYRING_GPG="${REPO_ROOT}/${KEYRING_BASENAME}.gpg"
@@ -149,6 +215,7 @@ die() { echo; echo "ERREUR: $*" >&2; exit 1; }
 echo "=================================================="
 echo " Virtua Repository Builder"
 echo "=================================================="
+echo "Track         : $RELEASE_TRACK (suite APT '$TRACK_SUITE', meta $TRACK_META)"
 echo "Repo root     : $REPO_ROOT"
 echo "Kernel dir    : $KERNEL_DIR"
 echo "Import dir    : $IMPORT_DIR"
@@ -162,7 +229,15 @@ echo
 
 [[ $EUID -eq 0 ]] || die "lance ce script avec sudo."
 
-# Prépare les répertoires de travail/publikation manquants pour éviter une
+# Un IMPORT_DIR passé explicitement en argument DOIT exister: le créer à la
+# volée transformerait une faute de frappe en "0 paquet importé" silencieux,
+# puis en republication du dépôt inchangé — pire, en publication d'un dépôt
+# vide si KERNEL_DIR l'était aussi.
+if (( $# == 1 )); then
+  [[ -d "$IMPORT_DIR" ]] || die "IMPORT_DIR introuvable: ${IMPORT_DIR}"
+fi
+
+# Prépare les répertoires de travail/publication manquants pour éviter une
 # création manuelle préalable sur un serveur dépôt neuf.
 mkdir -p "$REPO_ROOT" "$KERNEL_DIR" "$IMPORT_DIR"
 
@@ -223,6 +298,29 @@ else
   echo "  (import_dir = kernel_dir, rien à copier)"
 fi
 
+# Le filtre de paquets interdits ne s'appliquait qu'aux fichiers importés. Les
+# .deb déjà présents dans KERNEL_DIR (importés avant l'ajout du filtre, ou
+# déposés à la main) n'étaient jamais revérifiés et restaient donc indexés et
+# publiés. On revalide l'intégralité du dossier à chaque passage.
+echo "  Vérification des paquets déjà présents dans $KERNEL_DIR..."
+for f in "$KERNEL_DIR"/*.deb; do
+  [[ -e "$f" ]] || continue
+  existing_package="$(dpkg-deb -f "$f" Package)"
+  for forbidden_pattern in $FORBIDDEN_PACKAGE_PATTERNS; do
+    if [[ "$existing_package" == *"$forbidden_pattern"* ]]; then
+      if [[ "${STRICT_EXISTING:-0}" == "1" ]]; then
+        die "paquet '${existing_package}' présent dans ${KERNEL_DIR} mais interdit sur le track ${RELEASE_TRACK}.
+Fichier: ${f}
+Retire-le du dossier, puis relance."
+      fi
+      echo "  AVERTISSEMENT: '${existing_package}' n'appartient pas au track ${RELEASE_TRACK}"
+      echo "                 ($(basename "$f")) — il reste publié dans la suite '${TRACK_SUITE}'."
+      echo "                 Le retirer casserait les clients qui l'ont installé: décision"
+      echo "                 d'exploitation. Pour rendre ce cas bloquant: STRICT_EXISTING=1."
+    fi
+  done
+done
+
 # Normalise TOUS les .deb au format APT canonique <Package>_<Version>_<Arch>.deb.
 # dpkg-scanpackages n'indexe de façon fiable que les fichiers nommés ainsi:
 # des noms personnalisés (sans version/arch) sont ignorés -> meta non installable.
@@ -246,6 +344,28 @@ done
 ############################################################
 echo "[2/9] Purge des anciennes versions..."
 
+# Regroupe un paquet noyau par FAMILLE, en retirant la version du NOM.
+#
+# Sans ça la purge ne purgeait jamais rien: pour un noyau, la version est
+# incluse dans le nom du paquet (linux-image-7.1.10-auxinux-virtua-amd64), donc
+# "les versions du paquet X" valait toujours exactement 1, quel que soit
+# KEEP_VERSIONS. C'est pourquoi le dépôt accumulait 7.1.1, 7.1.3, 7.1.10...
+#
+#   linux-image-7.1.10-auxinux-virtua-amd64      -> linux-image::auxinux-virtua-amd64      (7.1.10)
+#   linux-image-7.2.2-DEV-auxinux-virtua-amd64   -> linux-image::DEV-auxinux-virtua-amd64  (7.2.2)
+#   kernel-virtua                                -> kernel-virtua        (version du paquet)
+#
+# Les noyaux DEV et prod tombent donc dans des familles distinctes et ne se
+# purgent jamais l'un l'autre.
+pkg_family_key() {
+  local pkg="$1" version="$2"
+  if [[ "$pkg" =~ ^(linux-[a-z]+)-([0-9]+(\.[0-9]+)+)-(.+)$ ]]; then
+    printf '%s::%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s\t%s\n' "$pkg" "$version"
+  fi
+}
+
 prune_old() {
   local n="$1"
   if (( n <= 0 )); then
@@ -253,36 +373,38 @@ prune_old() {
     return 0
   fi
 
-  local pkgs
-  pkgs="$(for f in "$KERNEL_DIR"/*.deb; do
-            [[ -e "$f" ]] || continue
-            printf '%s\t%s\n' "$(dpkg-deb -f "$f" Package)" "$(dpkg-deb -f "$f" Architecture)"
-          done | sort -u)"
+  # Un seul balayage du dossier (l'ancienne version relisait chaque .deb une
+  # fois par famille, sur des fichiers qui pèsent jusqu'à 2 Go).
+  local index famkey sortkey pkg version arch
+  index="$(
+    for f in "$KERNEL_DIR"/*.deb; do
+      [[ -e "$f" ]] || continue
+      pkg="$(dpkg-deb -f "$f" Package)"
+      version="$(dpkg-deb -f "$f" Version)"
+      arch="$(dpkg-deb -f "$f" Architecture)"
+      IFS=$'\t' read -r famkey sortkey < <(pkg_family_key "$pkg" "$version")
+      printf '%s\t%s\t%s\n' "${famkey}|${arch}" "$sortkey" "$f"
+    done | sort -t$'\t' -k1,1 -k2,2V
+  )"
 
-  local p arch
-  while IFS=$'\t' read -r p arch; do
-    [[ -n "$p" ]] || continue
-    [[ -n "$arch" ]] || continue
+  [[ -n "$index" ]] || { echo "  (aucun paquet à purger)"; return 0; }
+
+  local fam
+  while IFS= read -r fam; do
+    [[ -n "$fam" ]] || continue
     local files=()
-    mapfile -t files < <(
-      for f in "$KERNEL_DIR"/*.deb; do
-        [[ -e "$f" ]] || continue
-        if [[ "$(dpkg-deb -f "$f" Package)" == "$p" && "$(dpkg-deb -f "$f" Architecture)" == "$arch" ]]; then
-          printf '%s\t%s\n' "$(dpkg-deb -f "$f" Version)" "$f"
-        fi
-      done | sort -V | cut -f2-
-    )
+    mapfile -t files < <(awk -F'\t' -v F="$fam" '$1==F{print $3}' <<< "$index")
     local count=${#files[@]}
     if (( count > n )); then
       local remove=$(( count - n ))
-      echo "  $p [$arch]: $count versions -> suppression des $remove plus anciennes"
+      echo "  ${fam}: ${count} versions -> suppression des ${remove} plus anciennes"
       local i
       for ((i=0; i<remove; i++)); do
         echo "    rm $(basename "${files[$i]}")"
         rm -f "${files[$i]}"
       done
     fi
-  done <<< "$pkgs"
+  done < <(cut -d$'\t' -f1 <<< "$index" | sort -u)
 }
 
 prune_old "$KEEP_VERSIONS"
@@ -311,6 +433,12 @@ generate_meta_package() {
         # du vrai noyau, pas de linux-image-...-dbg / -dbgsym.
         linux-image-*-"${kernel_flavour}"-*-dbg) ;;
         linux-image-*-"${kernel_flavour}"-*-dbgsym) ;;
+        # Sur le track prod, kernel_flavour vaut 'auxinux-virtua' et le motif
+        # générique ci-dessous matcherait AUSSI un noyau DEV nommé
+        # linux-image-7.2.2-DEV-auxinux-virtua-amd64 (le '*' couvre 'DEV').
+        # kernel-virtua pointerait alors sur un noyau de test. On l'exclut.
+        # Sur le track dev ce motif ne matche rien (DEV-DEV-...), donc inoffensif.
+        linux-image-*-DEV-"${kernel_flavour}"-*) ;;
         linux-image-*-"${kernel_flavour}"-*)
           printf '%s\t%s\t%s\n' "$version" "$pkg" "$f"
           ;;
@@ -560,12 +688,12 @@ if [[ "$SIGN" == "1" ]]; then
   echo "  sudo wget -O /usr/share/keyrings/${KEYRING_BASENAME}.gpg \\"
   echo "       ${PUBLIC_REPO_URL}/${KEYRING_BASENAME}.gpg"
   echo
-  echo "  echo 'deb [signed-by=/usr/share/keyrings/${KEYRING_BASENAME}.gpg arch=amd64,arm64] ${PUBLIC_REPO_URL} kernel main' \\"
+  echo "  echo 'deb [signed-by=/usr/share/keyrings/${KEYRING_BASENAME}.gpg arch=amd64] ${PUBLIC_REPO_URL} ${DIST} main' \\"
   echo "       | sudo tee /etc/apt/sources.list.d/${SOURCES_LIST_NAME}.list"
   echo
 else
   echo "Configuration côté client (non signé):"
-  echo "  deb [trusted=yes arch=amd64,arm64] ${PUBLIC_REPO_URL} kernel main"
+  echo "  deb [trusted=yes arch=amd64] ${PUBLIC_REPO_URL} ${DIST} main"
   echo
 fi
 

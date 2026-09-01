@@ -22,6 +22,9 @@ die() { echo; echo "ERREUR: $*" >&2; exit 1; }
 #
 # Variables optionnelles (toutes ont une valeur par defaut) :
 #
+#   RELEASE_TRACK       : "prod" ou "dev" (defaut: prod)
+#                         prod -> X.Y.Z-auxinux-virtua-amd64      / kernel-virtua
+#                         dev  -> X.Y.Z-DEV-auxinux-virtua-amd64  / kernel-virtua-dev
 #   SOURCE              : "kernelorg" ou "debian" (defaut: kernelorg)
 #   PROFILE             : "virtua", "desktop" ou "auxinuxos" (defaut: virtua)
 #   TARGET_ARCH         : "amd64", "arm" ou "arm64" (defaut: amd64)
@@ -49,6 +52,15 @@ MODE="build"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-current}"
 RELEASE_BRANCH="${RELEASE_BRANCH:-}"
 
+# --- Canal de publication (track) : prod ou dev ---------------------------
+# NE PAS confondre avec RELEASE_CHANNEL (current/lts/mainline) qui sélectionne
+# la série kernel.org. RELEASE_TRACK sélectionne le canal de PUBLICATION :
+#   prod -> 7.1.12-auxinux-virtua-amd64      (paquet meta kernel-virtua)
+#   dev  -> 7.2.2-DEV-auxinux-virtua-amd64   (paquet meta kernel-virtua-dev)
+# Les deux canaux ont des suffixes, des dossiers de build et des suites APT
+# distincts : un kernel DEV ne peut jamais être servi aux hôtes de production.
+RELEASE_TRACK="${RELEASE_TRACK:-prod}"
+
 PROFILE="${PROFILE:-virtua}"
 PROFILES="${PROFILES:-}"
 TARGET_ARCH="${TARGET_ARCH:-amd64}"
@@ -57,7 +69,7 @@ KERNEL_FLAVOUR="${KERNEL_FLAVOUR:-}"
 META_PACKAGE="${META_PACKAGE:-}"
 VIRTUA_BUILD_NUMBER="${VIRTUA_BUILD_NUMBER:-1}"
 
-BUILD_ROOT="${BUILD_ROOT:-/usr/src/virtua-kernel-build}"
+BUILD_ROOT="${BUILD_ROOT:-}"   # défaut résolu après le track (suffixe -dev)
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 CHECK_DIR="${CHECK_DIR:-}"
 JOBS="${JOBS:-}"
@@ -73,9 +85,15 @@ KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
 # .deb binaire qui combine dans un même objet du code GPL-2.0 (Linux) et
 # CDDL (OpenZFS) — c'est ce que faisait l'ancien modèle "module précompilé"
 # (kmod-zfs-<release>), jugé risqué légalement.
-# OpenZFS 2.4.2+ supporte le kernel 7.0 (range 4.18 -> 7.0).
+# ATTENTION à la fenêtre de compatibilité kernel d'OpenZFS (fichier META du
+# tarball: Linux-Minimum / Linux-Maximum). Hors de cette fenêtre, DKMS échoue à
+# compiler chez le client — sans erreur bloquante visible à l'install.
+#   OpenZFS 2.4.2 -> Linux-Maximum 7.0  (INSUFFISANT pour un kernel 7.1/7.2)
+#   OpenZFS 2.4.4 -> Linux-Maximum 7.2
+# L'étape [7b/9] vérifie cette fenêtre et interrompt le build si elle est
+# dépassée, au lieu de publier un paquet ZFS qui ne compilera jamais.
 WITH_ZFS="${WITH_ZFS:-auto}"          # auto = activé sur amd64 natif, sinon off
-ZFS_VERSION="${ZFS_VERSION:-2.4.2}"   # version OpenZFS qui supporte 7.0
+ZFS_VERSION="${ZFS_VERSION:-2.4.4}"   # supporte les kernels jusqu'à 7.2
 ZFS_BASE_URL="${ZFS_BASE_URL:-https://github.com/openzfs/zfs/releases/download}"
 # Vérification d'intégrité de la source ZFS. Renseigne le sha256 du tarball
 # zfs-<ZFS_VERSION>.tar.gz (obligatoire sauf ALLOW_UNVERIFIED_SOURCE=1).
@@ -90,6 +108,11 @@ KERNEL_ORG_KEYS=(
 KERNEL_ORG_KEYSERVER="${KERNEL_ORG_KEYSERVER:-hkps://keys.openpgp.org}"
 # Garde-fou: ne JAMAIS mettre 1 en production. Uniquement build hors-ligne/test.
 ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-0}"
+# Garde-fou DISTINCT pour la source OpenZFS. Un build mainline/RC désactive la
+# vérif GPG du kernel (les snapshots git n'ont pas de .tar.sign), mais cela n'a
+# aucune raison d'affaiblir aussi la vérif du tarball ZFS, qui est toujours
+# publié avec un sha256 signé. Les deux gardes sont donc indépendantes.
+ALLOW_UNVERIFIED_ZFS="${ALLOW_UNVERIFIED_ZFS:-0}"
 
 usage() {
   cat <<EOF
@@ -103,6 +126,21 @@ Usage:
   $0 -check-kernelorg [CHECK_DIR=/path/to/debs]
   $0 -check-debian [CHECK_DIR=/path/to/debs]
   $0 -h | --help
+
+Publication track (prod / dev):
+  track=prod
+      Production kernel. Release: X.Y.Z-auxinux-virtua-amd64
+      Meta-package: kernel-virtua, published in APT suite 'kernel'.
+      This is the default.
+
+  track=dev
+      Test/development kernel. Release: X.Y.Z-DEV-auxinux-virtua-amd64
+      Meta-package: kernel-virtua-dev, published in APT suite 'kernel-dev'.
+      Separate build root, output directory, package names and APT suite, so a
+      dev kernel can never reach a production host through the prod suite.
+
+      Note: track=dev selects the PUBLICATION channel. It is unrelated to
+      --channel=mainline / --dev, which selects the kernel.org release series.
 
 Profile (fixed by this repository):
   profile=virtua
@@ -153,7 +191,9 @@ Options:
   TARGET_ARCH=name           Same as -arch=name.
   VIRTUA_BUILD_NUMBER=n      Increment when rebuilding the same upstream version.
   JOBS=n                     Parallel make jobs. Default: nproc.
-  BUILD_ROOT=/path           Build workspace. Default: /usr/src/virtua-kernel-build.
+  BUILD_ROOT=/path           Build workspace.
+                             Default: /usr/src/virtua-kernel-build (track prod)
+                                      /usr/src/virtua-kernel-build-dev (track dev)
   OUTPUT_DIR=/path           Output directory for generated .deb files.
   CHECK_DIR=/path            Directory inspected by -check-* modes.
 
@@ -166,10 +206,15 @@ OpenZFS en paquet source DKMS (modèle Debian, CDDL/GPL séparées):
   ZFS_VERSION=x.y.z          OpenZFS version. Default: 2.4.2 (supporte kernel 7.0).
   ZFS_SHA256=hash            sha256 du tarball zfs-<ZFS_VERSION>.tar.gz.
                              Obligatoire si WITH_ZFS=1 (sauf ALLOW_UNVERIFIED_SOURCE=1).
-  ALLOW_UNVERIFIED_SOURCE=1  Désactive la vérif source kernel ET ZFS (DÉCONSEILLÉ).
+  ALLOW_UNVERIFIED_SOURCE=1  Désactive la vérif GPG du source kernel (DÉCONSEILLÉ).
+  ALLOW_UNVERIFIED_ZFS=1     Désactive la vérif sha256 du source ZFS (DÉCONSEILLÉ).
+                             Garde distincte: un build mainline/RC relâche la
+                             première sans toucher à la seconde.
 
 Examples:
   $0
+  $0 KERNEL_VERSION=7.1.12                      # prod  -> 7.1.12-auxinux-virtua-amd64
+  $0 track=dev KERNEL_VERSION=7.2.2             # dev   -> 7.2.2-DEV-auxinux-virtua-amd64
   $0 --channel=current --branch=7.0
   $0 --channel=lts --branch=6.18
   $0 KERNEL_VERSION=6.12.31
@@ -205,10 +250,20 @@ EOF
 # Pratique sur macOS/Windows où l'hôte n'est pas Debian.
 # ============================================================
 run_in_docker() {
-  local script_dir image cname inner
+  local script_dir image cname inner _docker_track_suffix
   script_dir="$(cd "$(dirname "$0")" && pwd)"
   image="${DOCKER_IMAGE:-debian:13}"
-  cname="${DOCKER_NAME:-virtua-build}"
+  # Le track n'est pas encore résolu à ce stade (run_in_docker s'exécute avant
+  # le parsing complet): on le pré-détecte pour ne pas partager le volume de
+  # cache ni le nom de conteneur entre prod et dev.
+  _docker_track_suffix=""
+  for _a in "$@" ${DOCKER_PASSTHROUGH[@]+"${DOCKER_PASSTHROUGH[@]}"}; do
+    case "$_a" in
+      track=dev|--track=dev|RELEASE_TRACK=dev) _docker_track_suffix="-dev" ;;
+    esac
+  done
+  [[ "${RELEASE_TRACK:-prod}" != "dev" ]] || _docker_track_suffix="-dev"
+  cname="${DOCKER_NAME:-virtua-build${_docker_track_suffix}}"
 
   command -v docker >/dev/null 2>&1 \
     || { echo "ERREUR: docker introuvable. Installe/ouvre Docker Desktop." >&2; exit 1; }
@@ -227,17 +282,18 @@ run_in_docker() {
       id builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
       echo "builder ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/builder
       chmod 0440 /etc/sudoers.d/builder
-      chown -R builder:builder /work /output /usr/src/virtua-kernel-build
-      exec sudo -u builder -H env OUTPUT_DIR=/output DEPLOY="${DEPLOY}" DEPLOY_TARGET="${DEPLOY_TARGET}" ./build-virtua-kernel.sh "$@"'
+      chown -R builder:builder /work /output "${VIRTUA_BUILD_ROOT}"
+      exec sudo -u builder -H env OUTPUT_DIR=/output BUILD_ROOT="${VIRTUA_BUILD_ROOT}" DEPLOY="${DEPLOY}" DEPLOY_TARGET="${DEPLOY_TARGET}" ./build-virtua-kernel.sh "$@"'
 
   local -a docker_args=(
     --name "$cname"
     --platform linux/amd64
     -v "$script_dir":/work -w /work
     -v "$script_dir/output":/output
-    -v virtua-kernel-build:/usr/src/virtua-kernel-build
+    -v "virtua-kernel-build${_docker_track_suffix}":"/usr/src/virtua-kernel-build${_docker_track_suffix}"
     -e DEPLOY="${DEPLOY}"
     -e DEPLOY_TARGET="${DEPLOY_TARGET}"
+    -e VIRTUA_BUILD_ROOT="/usr/src/virtua-kernel-build${_docker_track_suffix}"
   )
 
   # Évite un conflit de nom si un run précédent a laissé un conteneur.
@@ -302,7 +358,8 @@ for arg in "$@"; do
     --branch=*|branch=*) RELEASE_BRANCH="${arg#*=}" ;;
     --current|--stable|--latest) RELEASE_CHANNEL="current" ;;
     --lts|--longterm) RELEASE_CHANNEL="lts" ;;
-    --mainline|--dev) RELEASE_CHANNEL="mainline" ;;
+    --mainline|--dev) RELEASE_CHANNEL="mainline" ;;   # note: --dev = mainline (série), PAS le track dev
+    track=*|--track=*|RELEASE_TRACK=*) RELEASE_TRACK="${arg#*=}" ;;
     profile=all) PROFILES="virtua desktop" ;;
     profile=virtua) PROFILE="virtua" ;;
     profile=desktop) PROFILE="desktop" ;;
@@ -326,6 +383,7 @@ for arg in "$@"; do
     no-zfs|without-zfs) WITH_ZFS="0" ;;
     ZFS_VERSION=*) ZFS_VERSION="${arg#*=}" ;;
     ZFS_SHA256=*) ZFS_SHA256="${arg#*=}" ;;
+    ALLOW_UNVERIFIED_ZFS=*) ALLOW_UNVERIFIED_ZFS="${arg#*=}" ;;
     CROSS_COMPILE=*) CROSS_COMPILE="${arg#*=}" ;;
     BUILD_ROOT=*) BUILD_ROOT="${arg#*=}" ;;
     OUTPUT_DIR=*) OUTPUT_DIR="${arg#*=}" ;;
@@ -342,6 +400,30 @@ case "$RELEASE_CHANNEL" in
   *) die "release channel invalide: ${RELEASE_CHANNEL}. Valeurs: current, lts, mainline." ;;
 esac
 
+# ============================================================
+# Track de publication: prod / dev
+# ============================================================
+# Chaque track a son propre suffixe de kernel, son paquet meta, son dossier de
+# build et son dossier de sortie. Rien n'est partagé, pour qu'un build dev ne
+# puisse ni écraser un artefact prod ni se retrouver dans la suite APT prod.
+case "$RELEASE_TRACK" in
+  prod|production|stable) RELEASE_TRACK="prod" ;;
+  dev|devel|test|testing) RELEASE_TRACK="dev" ;;
+  *) die "RELEASE_TRACK invalide: ${RELEASE_TRACK}. Valeurs: prod, dev." ;;
+esac
+
+if [[ "$RELEASE_TRACK" == "dev" ]]; then
+  TRACK_FLAVOUR="DEV-auxinux-virtua"
+  TRACK_META="kernel-virtua-dev"
+  TRACK_SUITE="kernel-dev"
+  TRACK_BUILD_SUFFIX="-dev"
+else
+  TRACK_FLAVOUR="auxinux-virtua"
+  TRACK_META="kernel-virtua"
+  TRACK_SUITE="kernel"
+  TRACK_BUILD_SUFFIX=""
+fi
+
 # This repository owns only the VirtuaOS hypervisor kernel. Desktop and
 # AuxiNuxOS workstation profiles live in ../AuxiNuxOS and must never be emitted
 # from this project or uploaded to the Virtua kernel channel.
@@ -349,10 +431,10 @@ esac
   || die "ce dépôt construit uniquement profile=virtua; utilise ../AuxiNuxOS pour le kernel AuxiNuxOS."
 [[ "$PROFILE" == "virtua" ]] \
   || die "profile=${PROFILE} n'appartient pas au projet Kernel/VirtuaOS."
-[[ -z "$KERNEL_FLAVOUR" || "$KERNEL_FLAVOUR" == "auxinux-virtua" ]] \
-  || die "KERNEL_FLAVOUR doit rester auxinux-virtua dans Kernel/VirtuaOS."
-[[ -z "$META_PACKAGE" || "$META_PACKAGE" == "kernel-virtua" ]] \
-  || die "META_PACKAGE doit rester kernel-virtua dans Kernel/VirtuaOS."
+[[ -z "$KERNEL_FLAVOUR" || "$KERNEL_FLAVOUR" == "$TRACK_FLAVOUR" ]] \
+  || die "KERNEL_FLAVOUR doit rester ${TRACK_FLAVOUR} sur le track ${RELEASE_TRACK}."
+[[ -z "$META_PACKAGE" || "$META_PACKAGE" == "$TRACK_META" ]] \
+  || die "META_PACKAGE doit rester ${TRACK_META} sur le track ${RELEASE_TRACK}."
 
 if [[ "$RELEASE_CHANNEL" == "mainline" || "${KERNEL_VERSION:-}" == *-rc* ]]; then
   # Choisir mainline est l'opt-in explicite requis pour le snapshot git non signé.
@@ -402,7 +484,10 @@ fi
 # signé GPG par OpenZFS). Évite d'avoir à le fournir pour la version par défaut.
 if [[ -z "$ZFS_SHA256" ]]; then
   case "$ZFS_VERSION" in
+    # Provenance: fichier zfs-<v>.sha256.asc signé GPG par le release manager
+    # OpenZFS (clé 4F3BA9AB6D1F8D683DC2DFB56AD860EED4598027).
     2.4.2) ZFS_SHA256="7e260d0e6af295bea4c5e241cac0a1aef07b58d8dd8035f7898ade3b1bbec78f" ;;
+    2.4.4) ZFS_SHA256="2a3c70d55a37cc71618a95a60e81ad66530201eb118d37741dc92efcf848c8b1" ;;
   esac
 fi
 
@@ -476,7 +561,7 @@ fi
 
 if [[ -z "$KERNEL_FLAVOUR" ]]; then
   case "$PROFILE" in
-    virtua) KERNEL_FLAVOUR="auxinux-virtua" ;;
+    virtua) KERNEL_FLAVOUR="$TRACK_FLAVOUR" ;;
     desktop) KERNEL_FLAVOUR="auxinux-desktop" ;;
     auxinuxos) KERNEL_FLAVOUR="auxinuxos" ;;
   esac
@@ -486,12 +571,16 @@ KERNEL_NAME_SUFFIX="${KERNEL_FLAVOUR}-${KERNEL_ARCH_SUFFIX}"
 
 if [[ -z "$META_PACKAGE" ]]; then
   case "$PROFILE" in
-    virtua) META_PACKAGE="kernel-virtua" ;;
+    virtua) META_PACKAGE="$TRACK_META" ;;
     desktop) META_PACKAGE="kernel-auxinux-desktop" ;;
     auxinuxos) META_PACKAGE="kernel-auxinuxos" ;;
   esac
 fi
 
+# Dossiers distincts par track: un build dev ne doit jamais réutiliser l'arbre
+# source ni le dossier de sortie du prod (sinon [8/9] recopierait des .deb de
+# l'autre canal dans OUTPUT_DIR, qui est importé tel quel par le dépôt).
+BUILD_ROOT="${BUILD_ROOT:-/usr/src/virtua-kernel-build${TRACK_BUILD_SUFFIX}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${BUILD_ROOT}/output}"
 CHECK_DIR="${CHECK_DIR:-${OUTPUT_DIR}}"
 if [[ -z "$JOBS" ]]; then
@@ -771,6 +860,7 @@ ZFS_DEPS=(
   autoconf automake libtool gawk
   uuid-dev libblkid-dev libudev-dev
   zlib1g-dev libaio-dev libattr1-dev libffi-dev
+  libtirpc-dev                        # XDR/RPC requis par native-deb-utils
   python3-dev python3-setuptools
   debhelper dh-python po-debconf      # packaging .deb natif (pas d'alien/rpm)
 )
@@ -955,6 +1045,7 @@ PKG_VERSION="${KERNEL_VERSION}-${KERNEL_NAME_SUFFIX}.${VIRTUA_BUILD_NUMBER}"
 echo
 echo "============================================================"
 echo " Virtua Kernel Builder"
+echo " Track         : ${RELEASE_TRACK} (suite APT '${TRACK_SUITE}', meta ${META_PACKAGE})"
 echo " Source        : ${SOURCE}"
 echo " Profile       : ${PROFILE}"
 echo " Target arch   : ${TARGET_ARCH} (kernel ARCH=${KBUILD_ARCH}, deb=${KBUILD_DEBARCH})"
@@ -1362,8 +1453,11 @@ if [[ "$WITH_ZFS" == "1" ]]; then
   fi
 
   # Vérification d'intégrité de la source ZFS (sha256 épinglé, OBLIGATOIRE).
-  if [[ "$ALLOW_UNVERIFIED_SOURCE" == "1" ]]; then
-    echo "AVERTISSEMENT: vérification du source ZFS IGNORÉE (ALLOW_UNVERIFIED_SOURCE=1)."
+  # Garde PROPRE à ZFS: un build mainline/RC relâche ALLOW_UNVERIFIED_SOURCE
+  # parce que les snapshots git kernel.org n'ont pas de .tar.sign — ce n'est
+  # pas une raison d'accepter un tarball ZFS non vérifié.
+  if [[ "$ALLOW_UNVERIFIED_ZFS" == "1" ]]; then
+    echo "AVERTISSEMENT: vérification du source ZFS IGNORÉE (ALLOW_UNVERIFIED_ZFS=1)."
   elif [[ -n "$ZFS_SHA256" ]]; then
     echo "Vérification sha256 du source ZFS..."
     echo "${ZFS_SHA256}  ${ZFS_TARBALL}" | sha256sum -c - \
@@ -1372,7 +1466,7 @@ if [[ "$WITH_ZFS" == "1" ]]; then
     die "ZFS_SHA256 non défini.
 Fournis le sha256 de ${ZFS_TARBALL} (page de release OpenZFS), ex:
   ZFS_SHA256=<hash> ./build-virtua-kernel.sh ...
-Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_SOURCE=1"
+Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_ZFS=1"
   fi
 
   rm -rf "$ZFS_SRC_DIR"
@@ -1381,8 +1475,32 @@ Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_SOURCE=1"
 
   cd "$ZFS_SRC_DIR"
 
+  # --- Fenêtre de compatibilité kernel déclarée par OpenZFS (fichier META) ---
+  # Hors de cette fenêtre, DKMS ne compilera pas chez le client. Comme l'échec
+  # DKMS à l'installation n'est PAS bloquant pour apt, publier un tel paquet
+  # donne un hôte sans ZFS qui se croit correctement installé (et un hôte
+  # ZFS-on-root qui ne remonte pas). On refuse donc de construire.
+  if [[ -f META ]]; then
+    zfs_kmin="$(awk -F'[[:space:]]+' '/^Linux-Minimum:/{print $2}' META)"
+    zfs_kmax="$(awk -F'[[:space:]]+' '/^Linux-Maximum:/{print $2}' META)"
+    kver_series="$(echo "$KERNEL_VERSION" | cut -d. -f1,2)"
+    echo "OpenZFS ${ZFS_VERSION}: kernels supportés ${zfs_kmin:-?} -> ${zfs_kmax:-?} (cible: ${kver_series})"
+
+    if [[ -n "$zfs_kmax" ]] && dpkg --compare-versions "$kver_series" gt "$zfs_kmax"; then
+      die "OpenZFS ${ZFS_VERSION} déclare Linux-Maximum ${zfs_kmax}, or ce build cible ${kver_series}.
+DKMS échouerait à compiler le module chez le client, SANS bloquer l'installation.
+Utilise une version d'OpenZFS qui couvre ${kver_series} (ZFS_VERSION=..., avec son
+ZFS_SHA256), ou construis ce kernel sans ZFS (no-zfs)."
+    fi
+    if [[ -n "$zfs_kmin" ]] && dpkg --compare-versions "$kver_series" lt "$zfs_kmin"; then
+      die "OpenZFS ${ZFS_VERSION} exige un kernel >= ${zfs_kmin}, or ce build cible ${kver_series}."
+    fi
+  else
+    echo "AVERTISSEMENT: fichier META absent du source ZFS; fenêtre kernel non vérifiable."
+  fi
+
   echo "Configuration OpenZFS (build source, sans ciblage d'un kernel précis)..."
-  ./configure --prefix=/usr
+  ./configure --prefix=/usr --with-tirpc
 
   echo "Construction du paquet source OpenZFS (native-deb-utils, DKMS)..."
   # native-deb-utils = cible Makefile.am NATIVE d'OpenZFS (dpkg-buildpackage),
@@ -1446,6 +1564,16 @@ for pkg in "${debs[@]}"; do
   pkg_arch="$(dpkg-deb -f "$pkg" Architecture)"
   pkg_version="$(dpkg-deb -f "$pkg" Version)"
 
+  # Les paquets -dbg/-dbgsym pèsent 1 à 2 Go et ne sont utiles qu'au débogage
+  # noyau. Le meta ne les référence pas: les publier ne fait que saturer le
+  # dépôt et la bande passante des clients.
+  case "$pkg_name" in
+    *-dbg|*-dbgsym)
+      echo "SKIP $(basename "$pkg") (symboles de debug, non publiés)"
+      continue
+      ;;
+  esac
+
   if [[ "$pkg_name" == "linux-libc-dev" ]]; then
     echo "SKIP $(basename "$pkg") (linux-libc-dev reste fourni par Debian)"
     rm -f "$OUTPUT_DIR/${pkg_name}"_*_"${pkg_arch}".deb \
@@ -1473,6 +1601,7 @@ Virtua Kernel Repository
 
 Kernel    : Linux ${KERNEL_VERSION}${LOCAL_VERSION}
 Version   : ${PKG_VERSION}
+Track     : ${RELEASE_TRACK} (suite APT: ${TRACK_SUITE})
 Source    : ${SOURCE}
 Profile   : ${PROFILE}
 Arch      : ${TARGET_ARCH} (${KBUILD_DEBARCH})
@@ -1480,8 +1609,14 @@ Base src  : linux-source-${KERNEL_MAJOR} (${SOURCE_PKG_VERSION})
 OpenZFS   : $([[ "$WITH_ZFS" == "1" ]] && echo "${ZFS_VERSION} (paquet source DKMS: openzfs-zfs-dkms)" || echo "non inclus")
 Généré    : $(date -Iseconds)
 
-APT source:
-deb [trusted=yes arch=${KBUILD_DEBARCH}] https://dep.auxinux.ca/VIRTUA kernel main
+APT source (dépôt signé — ne pas utiliser trusted=yes, qui désactiverait la
+vérification de signature côté client):
+
+  sudo wget -O /usr/share/keyrings/virtua-archive-keyring.gpg \\
+       https://dep.auxinux.ca/VIRTUA/virtua-archive-keyring.gpg
+
+  echo 'deb [signed-by=/usr/share/keyrings/virtua-archive-keyring.gpg arch=${KBUILD_DEBARCH}] https://dep.auxinux.ca/VIRTUA ${TRACK_SUITE} main' \\
+       | sudo tee /etc/apt/sources.list.d/virtua-kernel-${RELEASE_TRACK}.list
 
 Installation:
   sudo apt update
