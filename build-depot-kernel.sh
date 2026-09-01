@@ -509,12 +509,17 @@ generate_meta_package() {
 DKMS ne pourra pas compiler le module ZFS à l'installation sans ces headers.
 Ajoute ${header_pkg} au dépôt, ou retire openzfs-zfs-dkms de ${KERNEL_DIR}."
 
+    # openzfs-zfs-dkms porte sa version dans le champ Version, pas dans le nom
+    # du paquet: plusieurs versions coexistent donc dans le dossier. Prendre la
+    # PREMIÈRE dans l'ordre du glob revenait à épingler le meta sur la plus
+    # ANCIENNE (2.4.2 plutôt que 2.4.4) — c'est-à-dire, ici, sur celle dont la
+    # fenêtre kernel ne couvre pas les noyaux publiés. On prend la plus haute.
     zfs_version="$(
       for f in "$KERNEL_DIR"/*.deb; do
         [[ -e "$f" ]] || continue
         [[ "$(dpkg-deb -f "$f" Package)" == "$zfs_pkg" ]] || continue
-        dpkg-deb -f "$f" Version; break
-      done
+        dpkg-deb -f "$f" Version
+      done | sort -V | tail -n1
     )"
     case "$ZFS_META_DEP" in
       depends)
