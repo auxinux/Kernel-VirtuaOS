@@ -43,6 +43,18 @@ published, or DKMS will silently fail to build the module on install.
 `build-depot-kernel.sh` enforces this and refuses to generate the meta
 package otherwise.
 
+## License
+
+GPL-2.0-only, because this repository builds, configures and packages the
+Linux kernel.
+
+The kernel binaries published to the APT repository are a derivative work of
+Linux and therefore carry the GPL-2.0 section 3 obligation: they must be
+accompanied either by the complete corresponding source, or by a written offer
+to supply it. "Complete corresponding source" includes the exact upstream
+tarball, the `.config` used, and the scripts that control compilation — that
+is, this repository plus the pinned upstream version.
+
 ## Publication tracks: prod and dev
 
 The repository publishes two independent channels from the same scripts and the
