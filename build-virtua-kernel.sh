@@ -98,6 +98,9 @@ KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
 WITH_ZFS="${WITH_ZFS:-auto}"          # auto = activé sur amd64 natif, sinon off
 ZFS_VERSION="${ZFS_VERSION:-2.4.4}"   # supporte les kernels jusqu'à 7.2
 ZFS_BASE_URL="${ZFS_BASE_URL:-https://github.com/openzfs/zfs/releases/download}"
+# Publier aussi le userland OpenZFS (zfsutils, zed, libs) construit ici, pour
+# qu'il soit à la même version que le module DKMS. Cf. [7b/9].
+ZFS_PUBLISH_USERLAND="${ZFS_PUBLISH_USERLAND:-1}"
 # Vérification d'intégrité de la source ZFS. Renseigne le sha256 du tarball
 # zfs-<ZFS_VERSION>.tar.gz (obligatoire sauf ALLOW_UNVERIFIED_SOURCE=1).
 ZFS_SHA256="${ZFS_SHA256:-}"
@@ -206,7 +209,11 @@ OpenZFS en paquet source DKMS (modèle Debian, CDDL/GPL séparées):
                              against whatever kernel is actually present.
                              Default: auto (ON on native amd64, OFF when
                              cross-compiling). Aliases: with-zfs / no-zfs.
-  ZFS_VERSION=x.y.z          OpenZFS version. Default: 2.4.2 (supporte kernel 7.0).
+  ZFS_VERSION=x.y.z          OpenZFS version. Default: 2.4.4 (supporte kernel 7.2).
+  ZFS_PUBLISH_USERLAND=1|0   Publier aussi le userland OpenZFS (zfsutils, zed,
+                             libs) à la même version que le module DKMS.
+                             Défaut: 1. Debian ne fournit pas les paquets
+                             'openzfs-*' que le DKMS recommande.
   ZFS_SHA256=hash            sha256 du tarball zfs-<ZFS_VERSION>.tar.gz.
                              Obligatoire si WITH_ZFS=1 (sauf ALLOW_UNVERIFIED_SOURCE=1).
   ALLOW_UNVERIFIED_SOURCE=1  Désactive la vérif GPG du source kernel (DÉCONSEILLÉ).
@@ -387,6 +394,7 @@ for arg in "$@"; do
     ZFS_VERSION=*) ZFS_VERSION="${arg#*=}" ;;
     ZFS_SHA256=*) ZFS_SHA256="${arg#*=}" ;;
     ALLOW_UNVERIFIED_ZFS=*) ALLOW_UNVERIFIED_ZFS="${arg#*=}" ;;
+    ZFS_PUBLISH_USERLAND=*) ZFS_PUBLISH_USERLAND="${arg#*=}" ;;
     CROSS_COMPILE=*) CROSS_COMPILE="${arg#*=}" ;;
     BUILD_ROOT=*) BUILD_ROOT="${arg#*=}" ;;
     OUTPUT_DIR=*) OUTPUT_DIR="${arg#*=}" ;;
@@ -1532,16 +1540,43 @@ ZFS_SHA256), ou construis ce kernel sans ZFS (no-zfs)."
   (( ${#zfs_debs[@]} > 0 )) \
     || die "aucun paquet openzfs-zfs-dkms_*.deb trouvé dans $BUILD_ROOT après native-deb-utils."
 
-  echo "Nettoyage des paquets userspace OpenZFS (déjà fournis par Debian)..."
-  for u in "${zfs_userspace_debs[@]}"; do
-    case "$(basename "$u")" in
-      openzfs-zfs-dkms_*) ;;   # celui qu'on garde et publie
-      *) echo "  rm $(basename "$u")"; rm -f "$u" ;;
-    esac
-  done
+  # --- Userland OpenZFS ---------------------------------------------------
+  # Le module DKMS et les outils (zfs, zpool, libzfs...) doivent avoir la MÊME
+  # version: OpenZFS ne garantit pas la compatibilité entre un userland et un
+  # module de branches différentes.
+  #
+  # Ces paquets ne peuvent pas venir de Debian: openzfs-zfs-dkms recommande
+  # 'openzfs-zfsutils'/'openzfs-zfs-zed', qui n'existent nulle part chez Debian
+  # (le paquet Debian s'appelle zfsutils-linux). La recommandation était donc
+  # insatisfiable, et l'hôte se retrouvait avec le userland Debian de trixie
+  # (2.3.2) face à un module 2.4.4 — versions désaccordées.
+  #
+  # Aucun enjeu de licence ici: ce sont des binaires CDDL en espace utilisateur,
+  # jamais liés au noyau. Seule la partie noyau reste distribuée en source.
+  # Le paquet de suite de tests est exclu (volumineux, inutile en production).
+  if [[ "$ZFS_PUBLISH_USERLAND" == "1" ]]; then
+    echo "Conservation du userland OpenZFS (aligné sur le module DKMS)..."
+    for u in "${zfs_userspace_debs[@]}"; do
+      case "$(basename "$u")" in
+        openzfs-zfs-test_*)
+          echo "  rm $(basename "$u") (suite de tests, non publiée)"; rm -f "$u" ;;
+        *) echo "  garde $(basename "$u")" ;;
+      esac
+    done
+  else
+    echo "Nettoyage des paquets userspace OpenZFS (ZFS_PUBLISH_USERLAND=0)..."
+    for u in "${zfs_userspace_debs[@]}"; do
+      case "$(basename "$u")" in
+        openzfs-zfs-dkms_*) ;;   # celui qu'on garde et publie
+        *) echo "  rm $(basename "$u")"; rm -f "$u" ;;
+      esac
+    done
+  fi
 
-  echo "Paquet OpenZFS généré:"
-  for z in "${zfs_debs[@]}"; do echo "  $(basename "$z")"; done
+  echo "Paquets OpenZFS générés:"
+  shopt -s nullglob
+  for z in "$BUILD_ROOT"/openzfs-*.deb; do echo "  $(basename "$z")"; done
+  shopt -u nullglob
 else
   echo
   echo "[7b/9] Paquet OpenZFS (DKMS): désactivé (WITH_ZFS=${WITH_ZFS})."
@@ -1597,7 +1632,7 @@ for pkg in "${debs[@]}"; do
   fi
 
   case "$pkg_name" in
-    linux-image-*|linux-headers-*|openzfs-zfs-dkms)
+    linux-image-*|linux-headers-*|openzfs-*)
       dest_name="${pkg_name}.deb"
       ;;
     *)
