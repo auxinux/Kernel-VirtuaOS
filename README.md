@@ -70,14 +70,44 @@ A production host enables only the `kernel` suite, so it can never be offered a
 DEV kernel — the two channels do not share a package name.
 
 ```bash
-# Production
-./build-virtua-kernel.sh KERNEL_VERSION=7.1.12
+# Production (ligne 7.2, branche git prod/7.2)
+./build-virtua-kernel.sh KERNEL_VERSION=7.2.4
 sudo GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virtua-kernel
 
-# Test / DEV
-./build-virtua-kernel.sh track=dev KERNEL_VERSION=7.2.2
+# Test / DEV (ligne 7.3, branche git main)
+./build-virtua-kernel.sh track=dev KERNEL_VERSION=7.3.0
 sudo RELEASE_TRACK=dev GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virtua-kernel-dev
 ```
+
+### Lignes et branches git
+
+| Ligne kernel | Branche git | Track | Statut |
+|---|---|---|---|
+| 7.2.x | `prod/7.2` | `prod` | ligne de production courante |
+| 7.3.x | `main` | `dev` | ligne de développement |
+
+Les correctifs de config validés en production remontent par cherry-pick
+`prod/7.2` -> `main`, jamais l'inverse en masse.
+
+### Build à blanc
+
+`-config-only` applique et **vérifie** la configuration, puis s'arrête avant la
+compilation :
+
+```bash
+./build-virtua-kernel.sh KERNEL_VERSION=7.2.4 -config-only
+```
+
+L'étape `[6a]` indexe tous les symboles Kconfig de l'arbre source et contrôle
+que **chaque** option demandée par `cfg()` existe réellement dans cette version
+du noyau (erreur bloquante) et qu'elle a bien été retenue par `olddefconfig`
+(avertissement détaillé).
+
+C'est indispensable : `scripts/config` accepte sans broncher un symbole
+inexistant — il écrit la ligne dans `.config`, qu'`olddefconfig` supprime
+ensuite en silence. Un symbole renommé entre deux versions du noyau était donc
+un no-op parfaitement invisible. Le passage en 7.2.4 en a révélé huit, dont un
+(`CGROUP_NS`) présent dans le script depuis l'import initial.
 
 Client configuration:
 
@@ -113,6 +143,9 @@ package that can never compile.
 |---|---|
 | 2.4.2 | 7.0 |
 | 2.4.4 | 7.2 |
+
+La garde compare la **série** du noyau, pas sa révision : un kernel 7.2.4 est
+comparé comme `7.2`, donc couvert par OpenZFS 2.4.4.
 
 The default is OpenZFS 2.4.4, which covers the 7.1 and 7.2 kernel series. When
 bumping `ZFS_VERSION`, also pin the matching `ZFS_SHA256` (from the GPG-signed
