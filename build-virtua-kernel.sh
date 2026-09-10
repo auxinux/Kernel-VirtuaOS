@@ -1165,7 +1165,6 @@ cfg --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
 cfg --disable DEBUG_INFO_REDUCED
 cfg --disable DEBUG_INFO_SPLIT
 cfg --enable DEBUG_INFO_BTF
-cfg --enable PAHOLE_HAS_SPLIT_BTF
 cfg --enable DEBUG_INFO_BTF_MODULES
 
 # --- Compression: kernel et modules ----------------------------------------
@@ -1194,7 +1193,7 @@ cfg --enable KVM_XEN
 cfg --enable VFIO
 cfg --enable VFIO_PCI
 cfg --enable VFIO_IOMMU_TYPE1
-cfg --enable VFIO_MDEV
+# VFIO_MDEV: tristate sans prompt, auto-sélectionné par les pilotes mdev.
 cfg --enable IOMMUFD           # interface moderne QEMU/VFIO
 cfg --enable VFIO_DEVICE_CDEV  # exposition VFIO via iommufd
 cfg --enable PCI_STUB           # bind device pour passthrough
@@ -1235,12 +1234,12 @@ cfg --module VIRTIO_PMEM       # mémoire persistante VirtIO
 cfg --enable VHOST
 cfg --enable VHOST_NET
 cfg --enable VHOST_VSOCK
-cfg --enable VHOST_SCSI
+cfg --module VHOST_SCSI
 cfg --enable VHOST_IOTLB
 cfg --module VHOST_VDPA
 cfg --enable VDPA
 cfg --module VP_VDPA
-cfg --module MLX5_VDPA
+cfg --module MLX5_VDPA_NET
 cfg --enable VSOCKETS
 cfg --enable VIRTIO_VSOCKETS
 
@@ -1254,7 +1253,7 @@ cfg --enable BRIDGE
 cfg --enable VLAN_8021Q
 cfg --module VXLAN
 cfg --module GENEVE
-cfg --enable BONDING
+cfg --module BONDING
 cfg --module OPENVSWITCH
 cfg --enable NETFILTER
 cfg --enable NF_TABLES
@@ -1294,7 +1293,6 @@ cfg --enable NET_NS
 cfg --enable PID_NS
 cfg --enable IPC_NS
 cfg --enable UTS_NS
-cfg --enable CGROUP_NS
 cfg --enable TIME_NS
 cfg --enable OVERLAY_FS
 cfg --enable SECCOMP
@@ -1318,7 +1316,6 @@ cfg --enable BLK_DEV_THROTTLING
 # sans erreur visible. On reprend la chaîne exacte de Debian 13.
 cfg --enable SECURITY
 cfg --enable SECURITY_APPARMOR
-cfg --enable SECURITY_APPARMOR_BOOTPARAM_VALUE
 cfg --enable SECURITY_LANDLOCK   # utilisé par systemd 257
 cfg --enable SECURITY_YAMA
 cfg --enable SECURITY_SELINUX
@@ -1349,9 +1346,14 @@ cfg --enable NF_NAT
 cfg --enable NETFILTER_XT_MATCH_ADDRTYPE
 cfg --enable NETFILTER_XT_MATCH_CONNTRACK
 cfg --enable IP_NF_IPTABLES
-cfg --enable IP_NF_FILTER
-cfg --enable IP_NF_NAT
-cfg --enable IP_NF_TARGET_MASQUERADE
+# En 7.x les cibles ci-dessous dépendent de IP_NF_IPTABLES_LEGACY, absent de la
+# config Debian (ère nftables). Le chemin nft est déjà couvert par NFT_NAT et
+# NFT_MASQ, mais on garde le backend legacy en modules: certains déploiements
+# Docker/LXC plus anciens s'appuient encore sur iptables-legacy.
+cfg --module IP_NF_IPTABLES_LEGACY
+cfg --module IP_NF_FILTER
+cfg --module IP_NF_NAT
+cfg --module IP_NF_TARGET_MASQUERADE
 cfg --enable NFT_NAT
 cfg --enable NFT_MASQ
 
@@ -1391,7 +1393,6 @@ cfg --module F2FS_FS
 cfg --disable BTRFS_DEBUG
 cfg --disable BTRFS_ASSERT
 cfg --disable BTRFS_FS_RUN_SANITY_TESTS
-cfg --disable BTRFS_FS_REF_VERIFY
 
 # Compression BTRFS en built-in: sans ça, compress=zstd est inutilisable au
 # montage de la racine.
@@ -1449,12 +1450,12 @@ cfg --module DRM_VMWGFX
 cfg --enable INPUT_EVDEV
 cfg --enable HID
 cfg --enable HID_GENERIC
-cfg --enable USB_HID
+cfg --module USB_HID
 cfg --enable USB_SUPPORT
-cfg --enable USB_XHCI_HCD
-cfg --enable USB_EHCI_HCD        # indispensable avant 2012
-cfg --enable USB_OHCI_HCD
-cfg --enable USB_UHCI_HCD
+cfg --module USB_XHCI_HCD
+cfg --module USB_EHCI_HCD        # indispensable avant 2012
+cfg --module USB_OHCI_HCD
+cfg --module USB_UHCI_HCD
 cfg --module USB_STORAGE
 cfg --enable SERIO_I8042         # PS/2, machines pré-2013
 cfg --enable KEYBOARD_ATKBD
@@ -1514,13 +1515,17 @@ cfg --enable SCHED_CLUSTER
 cfg --enable X86_X2APIC
 cfg --enable NUMA
 cfg --enable NUMA_BALANCING
-cfg --enable X86_5LEVEL
 
 # Ordonnancement adapté à un hôte VM + conteneurs.
+# La base Debian sélectionne déjà PREEMPT_LAZY et NO_HZ_FULL, et ce sont de
+# MEILLEURS choix qu'un PREEMPT_VOLUNTARY/NO_HZ_IDLE forcés:
+#   - PREEMPT_LAZY: latence proche du preempt complet sans son surcoût.
+#   - NO_HZ_FULL: mode tickless intégral sur les CPU listés dans nohz_full=,
+#     gain réel de latence pour des vCPU épinglés. Sans nohz_full= au boot, le
+#     comportement est celui de NO_HZ_IDLE: on ne perd rien.
+# PREEMPT_DYNAMIC laisse de toute façon basculer le modèle au boot (preempt=).
 cfg --enable PREEMPT_DYNAMIC     # preempt= sélectionnable au boot
-cfg --enable PREEMPT_VOLUNTARY   # défaut raisonnable pour un hyperviseur
 cfg --enable HZ_250
-cfg --enable NO_HZ_IDLE
 cfg --enable HIGH_RES_TIMERS
 cfg --enable RCU_NOCB_CPU        # opt-in au boot via rcu_nocbs=
 # SCHED_AUTOGROUP est une fonctionnalité desktop (groupement par session tty)
@@ -1547,10 +1552,12 @@ cfg --module IPMI_WATCHDOG
 cfg --disable SUSPEND
 cfg --disable HIBERNATION
 
-# Entropie: sans confiance au RDRAND/bootloader, getrandom() peut bloquer
-# plusieurs minutes au démarrage sur du matériel ancien.
-cfg --enable RANDOM_TRUST_CPU
-cfg --enable RANDOM_TRUST_BOOTLOADER
+# Entropie: RANDOM_TRUST_CPU et RANDOM_TRUST_BOOTLOADER ont été SUPPRIMÉS du
+# Kconfig (plus aucun symbole en 7.2). La confiance au RDRAND et à l'entropie
+# du bootloader est désormais active par défaut et se pilote uniquement au
+# boot: random.trust_cpu=0 / random.trust_bootloader=0 pour la désactiver.
+# Rien à configurer ici — le blocage de getrandom() au démarrage ne se produit
+# donc plus par défaut.
 
 # Détecter et TRACER au lieu de redémarrer en silence.
 cfg --enable LOCKUP_DETECTOR
@@ -1586,9 +1593,9 @@ cfg --enable EDAC
 cfg --module EDAC_AMD64          # AMD K8 -> Zen
 cfg --module EDAC_I3000
 cfg --module EDAC_I3200
-cfg --module EDAC_I5000
+# EDAC_I5000 (Greencreek/Blackford) est 'depends on BROKEN' en amont: exclu.
 cfg --module EDAC_I5100
-cfg --module EDAC_I7300_MC
+cfg --module EDAC_I7300
 cfg --module EDAC_I7CORE
 cfg --module EDAC_IE31200
 cfg --module EDAC_SBRIDGE
