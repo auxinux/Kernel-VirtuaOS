@@ -1350,6 +1350,9 @@ cfg --enable IP_NF_IPTABLES
 # config Debian (ère nftables). Le chemin nft est déjà couvert par NFT_NAT et
 # NFT_MASQ, mais on garde le backend legacy en modules: certains déploiements
 # Docker/LXC plus anciens s'appuient encore sur iptables-legacy.
+# NETFILTER_XTABLES_LEGACY est desactive chez Debian (ere nftables) et
+# conditionne tout le backend legacy: il faut l'activer AVANT les cibles.
+cfg --enable NETFILTER_XTABLES_LEGACY
 cfg --module IP_NF_IPTABLES_LEGACY
 cfg --module IP_NF_FILTER
 cfg --module IP_NF_NAT
