@@ -77,6 +77,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-}"
 CHECK_DIR="${CHECK_DIR:-}"
 JOBS="${JOBS:-}"
 DEPLOY="${DEPLOY:-0}"
+# Build à blanc: applique et VÉRIFIE la config, puis s'arrête avant la
+# compilation. Sert à valider les ~200 options (et leurs noms de symboles)
+# en quelques minutes au lieu d'attendre une compilation complète.
+CONFIG_ONLY="${CONFIG_ONLY:-0}"
 DEPLOY_TARGET="${DEPLOY_TARGET:-}"
 
 KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
@@ -386,6 +390,7 @@ for arg in "$@"; do
     KERNEL_FLAVOUR=*) KERNEL_FLAVOUR="${arg#*=}" ;;
     META_PACKAGE=*) META_PACKAGE="${arg#*=}" ;;
     KERNEL_VERSION=*) KERNEL_VERSION="${arg#*=}" ;;
+    -config-only|--config-only|config-only) CONFIG_ONLY=1 ;;
     VIRTUA_BUILD_NUMBER=*) VIRTUA_BUILD_NUMBER="${arg#*=}" ;;
     JOBS=*) JOBS="${arg#*=}" ;;
     WITH_ZFS=*) WITH_ZFS="${arg#*=}" ;;
@@ -623,7 +628,47 @@ fi
 # Helpers
 # ============================================================
 
-cfg() { ./scripts/config "$@" || true; }
+# Table des options demandées par les blocs de configuration plus bas.
+# Format: "SYMBOLE<TAB>ACTION<TAB>VALEUR_ATTENDUE". Elle est rejouée par
+# l'étape [6/9], qui vérifie que CHAQUE option demandée existe réellement dans
+# cette version du noyau ET qu'elle a bien été retenue par olddefconfig.
+CFG_REQUESTS=()
+
+# NE JAMAIS remettre "|| true" ici.
+# scripts/config accepte sans broncher un symbole inexistant: il écrit la ligne
+# dans .config, qu'olddefconfig supprime ensuite en silence. Un symbole renommé
+# entre deux versions du noyau (MICROCODE_INTEL/MICROCODE_AMD fusionnés dans
+# MICROCODE en 6.x, famille MITIGATION_*, drivers crypto x86...) devenait donc
+# un no-op parfaitement invisible. La détection réelle est faite en [6/9] via
+# l'index des symboles Kconfig de l'arbre source.
+cfg() {
+  local action="${1:-}" sym="${2:-}" expect
+  case "$action" in
+    --enable)  expect="y" ;;
+    --module)  expect="m" ;;
+    --disable) expect="n" ;;
+    --set-str) expect="str:${3-}" ;;
+    --set-val) expect="val:${3-}" ;;
+    *) die "cfg(): action non supportée: '${action}' (symbole ${sym:-?})." ;;
+  esac
+  [[ -n "$sym" ]] || die "cfg(): symbole manquant pour l'action ${action}."
+  CFG_REQUESTS+=("${sym}"$'\t'"${action}"$'\t'"${expect}")
+  ./scripts/config "$@" \
+    || die "scripts/config a échoué: $* (arbre source incohérent?)"
+}
+
+# Valeur réellement présente dans .config pour un symbole (diagnostic).
+cfg_actual() {
+  local line
+  line="$(grep -m1 "^CONFIG_${1}=" .config || true)"
+  if [[ -n "$line" ]]; then
+    echo "${line#*=}"
+  elif grep -q "^# CONFIG_${1} is not set\$" .config; then
+    echo "n"
+  else
+    echo "non défini"
+  fi
+}
 
 is_supported_debian13_base() {
   case "${ID:-}" in
@@ -1103,9 +1148,40 @@ cfg --disable LOCALVERSION_AUTO
 cfg --set-str SYSTEM_TRUSTED_KEYS ""
 cfg --set-str SYSTEM_REVOCATION_KEYS ""
 
-# --- Réduction de taille (gain principal) ---
-cfg --disable DEBUG_INFO
-cfg --disable DEBUG_INFO_BTF
+# --- Infos de debug et BTF --------------------------------------------------
+# BTF (DEBUG_INFO_BTF) est requis par tout l'outillage eBPF CO-RE moderne:
+# bpftrace, cilium, systemd-oomd, l'observabilité des conteneurs. C'est le
+# défaut Debian et l'hôte VirtuaOS est justement un hôte à conteneurs.
+#
+# ATTENTION à la contrainte Kconfig (lib/Kconfig.debug):
+#     config DEBUG_INFO_BTF
+#         depends on !DEBUG_INFO_SPLIT && !DEBUG_INFO_REDUCED
+# BTF et DEBUG_INFO_REDUCED sont donc MUTUELLEMENT EXCLUSIFS: il faut du DWARF
+# complet. Le surcoût est du temps de build et un gros vmlinux intermédiaire,
+# PAS un gros vmlinuz: seul le BTF dédupliqué (~4-6 Mo) part dans l'image.
+# Le paquet linux-image-*-dbg produit au passage n'est pas publié ([8/9]).
+cfg --disable DEBUG_INFO_NONE
+cfg --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+cfg --disable DEBUG_INFO_REDUCED
+cfg --disable DEBUG_INFO_SPLIT
+cfg --enable DEBUG_INFO_BTF
+cfg --enable PAHOLE_HAS_SPLIT_BTF
+cfg --enable DEBUG_INFO_BTF_MODULES
+
+# --- Compression: kernel et modules ----------------------------------------
+cfg --enable KERNEL_ZSTD
+cfg --enable MODULE_COMPRESS
+cfg --enable MODULE_COMPRESS_ZSTD
+
+# --- Modules hors-arbre (OpenZFS DKMS): gardes OBLIGATOIRES ----------------
+# TRIM_UNUSED_KSYMS élague les symboles exportés non utilisés en interne et
+# casse la compilation de TOUT module hors-arbre. Le module ZFS DKMS ne se
+# construirait plus chez le client — et un échec DKMS ne fait PAS échouer apt.
+cfg --disable TRIM_UNUSED_KSYMS
+# Un module DKMS est non signé: MODULE_SIG_FORCE ou un lockdown actif
+# l'empêcheraient de charger, et un hôte ZFS-on-root ne remonterait pas.
+cfg --disable MODULE_SIG_FORCE
+cfg --enable MODVERSIONS
 
 if [[ "$PROFILE" == "virtua" ]]; then
 
@@ -1126,6 +1202,18 @@ cfg --enable IOMMU_SUPPORT
 cfg --enable INTEL_IOMMU
 cfg --enable AMD_IOMMU
 cfg --enable IRQ_REMAP
+cfg --enable VFIO_PCI_IGD        # passthrough iGPU Intel
+# INTEL_IOMMU_DEFAULT_ON reste volontairement OFF: l'activer par défaut casse
+# le boot sur certaines cartes anciennes. Opt-in documenté: intel_iommu=on iommu=pt.
+cfg --disable INTEL_IOMMU_DEFAULT_ON
+
+# --- KVM: fonctions avancées ---
+cfg --enable KVM_SMM
+cfg --enable KVM_AMD_SEV         # chiffrement mémoire invité AMD (SEV/SEV-ES/SNP)
+cfg --disable KVM_WERROR
+# PARAVIRT: indispensable si VirtuaOS tourne lui-même dans une VM (imbrication).
+cfg --enable PARAVIRT
+cfg --enable PARAVIRT_SPINLOCKS
 
 # --- Perf hyperviseur ---
 cfg --enable KSM                # dedup memoire entre VMs
@@ -1150,6 +1238,9 @@ cfg --enable VHOST_VSOCK
 cfg --enable VHOST_SCSI
 cfg --enable VHOST_IOTLB
 cfg --module VHOST_VDPA
+cfg --enable VDPA
+cfg --module VP_VDPA
+cfg --module MLX5_VDPA
 cfg --enable VSOCKETS
 cfg --enable VIRTIO_VSOCKETS
 
@@ -1169,6 +1260,16 @@ cfg --enable NETFILTER
 cfg --enable NF_TABLES
 cfg --enable NET_SCHED
 cfg --enable NET_CLS_CGROUP
+cfg --enable NET_CLS_BPF
+cfg --enable NET_ACT_BPF
+cfg --enable XFRM_USER
+cfg --module WIREGUARD
+# IPVS: services Docker Swarm / Kubernetes.
+cfg --module IP_VS
+cfg --module IP_VS_RR
+cfg --module IP_VS_WRR
+cfg --enable IP_VS_NFCT
+cfg --enable BRIDGE_VLAN_FILTERING
 
 # --- LXC / Docker / containers ---
 cfg --enable CGROUPS
@@ -1205,7 +1306,41 @@ cfg --enable KEYS
 cfg --enable DEVTMPFS
 cfg --enable BPF_SYSCALL
 cfg --enable BPF_JIT
+cfg --enable BPF_JIT_ALWAYS_ON
+cfg --enable BPF_UNPRIV_DEFAULT_OFF
+cfg --enable CGROUP_MISC
+cfg --enable CGROUP_WRITEBACK
+cfg --enable BLK_DEV_THROTTLING
+
+# --- LSM: la chaîne compte autant que les options --------------------------
+# SECURITY_APPARMOR=y ne suffit PAS: si 'apparmor' n'est pas dans CONFIG_LSM,
+# les profils AppArmor de Docker et LXC ne s'appliquent jamais — en silence,
+# sans erreur visible. On reprend la chaîne exacte de Debian 13.
+cfg --enable SECURITY
 cfg --enable SECURITY_APPARMOR
+cfg --enable SECURITY_APPARMOR_BOOTPARAM_VALUE
+cfg --enable SECURITY_LANDLOCK   # utilisé par systemd 257
+cfg --enable SECURITY_YAMA
+cfg --enable SECURITY_SELINUX
+cfg --set-str LSM "landlock,lockdown,yama,integrity,apparmor,bpf"
+
+# --- Prérequis systemd (fichier REQUIREMENTS amont) ------------------------
+# Aujourd'hui hérités par chance de la config Debian, jamais vérifiés.
+cfg --enable FHANDLE
+cfg --enable DMIID
+cfg --enable INOTIFY_USER
+cfg --enable SIGNALFD
+cfg --enable TIMERFD
+cfg --enable EPOLL
+cfg --enable SYSVIPC
+cfg --enable TMPFS
+cfg --enable TMPFS_POSIX_ACL
+cfg --enable TMPFS_XATTR
+cfg --enable CRYPTO_USER_API_HASH
+cfg --enable KCMP
+cfg --enable NET_NS
+cfg --enable PROC_FS
+cfg --enable SYSFS
 
 # --- Réseau containers (NAT Docker) ---
 cfg --enable BRIDGE_NETFILTER
@@ -1242,17 +1377,314 @@ cfg --module SQUASHFS
 cfg --module AUTOFS_FS
 
 # --- Filesystems ---
-cfg --enable EXT4_FS            # frequent comme racine -> built-in
-cfg --module BTRFS_FS
+# EXT4 et BTRFS TOUS DEUX built-in: le parc est mixte (racines ext4 héritées
+# du 7.1.x et racines BTRFS). Un pilote de racine en built-in monte / même si
+# l'initramfs est cassé ou périmé — c'est directement de la robustesse au
+# reboot, le sujet de cette version.
+cfg --enable EXT4_FS
+cfg --enable BTRFS_FS
+cfg --enable BTRFS_FS_POSIX_ACL
 cfg --module XFS_FS
 cfg --module F2FS_FS
 
-# --- GPU lourds inutiles pour hyperviseur headless ---
+# BTRFS: tout le debug coupé (gain réel sur le chemin d'écriture).
+cfg --disable BTRFS_DEBUG
+cfg --disable BTRFS_ASSERT
+cfg --disable BTRFS_FS_RUN_SANITY_TESTS
+cfg --disable BTRFS_FS_REF_VERIFY
+
+# Compression BTRFS en built-in: sans ça, compress=zstd est inutilisable au
+# montage de la racine.
+cfg --enable ZSTD_COMPRESS
+cfg --enable ZSTD_DECOMPRESS
+cfg --enable LZO_COMPRESS
+cfg --enable LZO_DECOMPRESS
+
+# Checksums BTRFS accélérés matériellement (crc32c par défaut).
+cfg --enable CRYPTO_CRC32C
+cfg --enable CRYPTO_XXHASH
+cfg --enable CRYPTO_BLAKE2B
+cfg --enable CRYPTO_SHA256
+
+# Ordonnanceurs d'E/S: mq-deadline par défaut, kyber/bfq disponibles.
+cfg --enable MQ_IOSCHED_DEADLINE
+cfg --enable MQ_IOSCHED_KYBER
+cfg --enable IOSCHED_BFQ
+cfg --enable BLK_WBT
+cfg --enable BLK_WBT_MQ
+
+# --- GPU lourds: volontairement absents -------------------------------------
+# Sur un hyperviseur c'est le BON choix: un pilote hôte lié au GPU empêche de
+# le céder à une VM en passthrough VFIO.
 cfg --disable DRM_AMDGPU
 cfg --disable DRM_NOUVEAU
 cfg --disable DRM_RADEON
 cfg --disable DRM_XE
 cfg --disable DRM_I915
+
+# --- Console serveur --------------------------------------------------------
+# Sans pilote d'affichage, la machine boote et fonctionne mais l'écran reste
+# NOIR — régulièrement diagnostiqué à tort comme "plantée au reboot".
+# AST (ASPEED) et MGAG200 (Matrox G200) sont les contrôleurs des BMC présents
+# sur la quasi-totalité des cartes serveur (iDRAC, iLO, Supermicro).
+cfg --enable VT
+cfg --enable VT_CONSOLE
+cfg --enable FRAMEBUFFER_CONSOLE
+cfg --enable FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
+cfg --enable DRM
+cfg --enable DRM_KMS_HELPER
+cfg --enable DRM_FBDEV_EMULATION
+cfg --enable DRM_SIMPLEDRM
+cfg --enable SYSFB_SIMPLEFB
+cfg --module DRM_AST
+cfg --module DRM_MGAG200
+# Affichages émulés, pour un VirtuaOS lui-même invité (imbrication).
+cfg --module DRM_BOCHS
+cfg --module DRM_QXL
+cfg --module DRM_VIRTIO_GPU
+cfg --module DRM_VMWGFX
+
+# --- Entrée console: PS/2 et USB -------------------------------------------
+# Sans ça, aucun clavier en rescue GRUB/console sur les machines anciennes.
+cfg --enable INPUT_EVDEV
+cfg --enable HID
+cfg --enable HID_GENERIC
+cfg --enable USB_HID
+cfg --enable USB_SUPPORT
+cfg --enable USB_XHCI_HCD
+cfg --enable USB_EHCI_HCD        # indispensable avant 2012
+cfg --enable USB_OHCI_HCD
+cfg --enable USB_UHCI_HCD
+cfg --module USB_STORAGE
+cfg --enable SERIO_I8042         # PS/2, machines pré-2013
+cfg --enable KEYBOARD_ATKBD
+
+# --- Console série ----------------------------------------------------------
+# Seul moyen de capturer une panic de reboot sur un serveur distant.
+cfg --enable SERIAL_8250
+cfg --enable SERIAL_8250_CONSOLE
+cfg --enable SERIAL_CORE_CONSOLE
+
+# ============================================================
+# Plateforme CPU: couvrir Intel et AMD sur 12 ans et plus
+# ============================================================
+# En 7.2 le choix "x86-64 Processor family" (GENERIC_CPU/MK8/MCORE2) a été
+# SUPPRIMÉ d'arch/x86/Kconfig.cpu: un build amd64 est déjà en baseline
+# -march=x86-64, donc compatible de l'Athlon 64 à Zen 6. La couverture est
+# acquise par construction — il ne reste qu'à la protéger.
+#
+# X86_NATIVE_CPU compile en -march=native, produisant un kernel accordé au CPU
+# de la MACHINE DE BUILD: il tombe en #UD sur toute machine plus ancienne.
+# C'est littéralement le mécanisme "ça boote ici, pas là".
+cfg --disable X86_NATIVE_CPU
+
+# Microcode: errata CPU (TSX Haswell, AMD fam 15h). En 6.x/7.x les symboles
+# MICROCODE_INTEL et MICROCODE_AMD ont été FUSIONNÉS dans MICROCODE.
+cfg --enable MICROCODE
+# Le chargement à chaud est une source connue de corruption/panic: on charge
+# via l'initramfs au démarrage, pas sur un système en marche.
+cfg --disable MICROCODE_LATE_LOADING
+
+# Fréquence: aucun driver ne couvre 12 ans à lui seul.
+#   X86_ACPI_CPUFREQ : Core 2 -> Sandy Bridge, AMD K10/Bulldozer/Piledriver
+#   X86_POWERNOW_K8  : AMD K8/K10
+#   X86_INTEL_PSTATE : Sandy Bridge et suivants
+#   X86_AMD_PSTATE   : Zen 2 et suivants UNIQUEMENT
+# Sans acpi-cpufreq, tout AMD antérieur à Zen 2 tourne à fréquence figée.
+cfg --enable CPU_FREQ
+cfg --enable X86_ACPI_CPUFREQ
+cfg --module X86_POWERNOW_K8
+cfg --enable X86_INTEL_PSTATE
+cfg --enable X86_AMD_PSTATE
+cfg --module X86_PCC_CPUFREQ
+cfg --enable CPU_FREQ_GOV_SCHEDUTIL
+cfg --enable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+cfg --enable CPU_FREQ_GOV_PERFORMANCE
+cfg --enable CPU_FREQ_GOV_POWERSAVE
+cfg --enable CPU_FREQ_GOV_ONDEMAND
+cfg --enable CPU_IDLE
+cfg --enable INTEL_IDLE
+
+# Topologie: Turbo Boost Max 3.0, SMT, chiplets Zen.
+cfg --enable SMP
+cfg --enable SCHED_MC
+cfg --enable SCHED_MC_PRIO
+cfg --enable SCHED_SMT
+cfg --enable SCHED_CLUSTER
+cfg --enable X86_X2APIC
+cfg --enable NUMA
+cfg --enable NUMA_BALANCING
+cfg --enable X86_5LEVEL
+
+# Ordonnancement adapté à un hôte VM + conteneurs.
+cfg --enable PREEMPT_DYNAMIC     # preempt= sélectionnable au boot
+cfg --enable PREEMPT_VOLUNTARY   # défaut raisonnable pour un hyperviseur
+cfg --enable HZ_250
+cfg --enable NO_HZ_IDLE
+cfg --enable HIGH_RES_TIMERS
+cfg --enable RCU_NOCB_CPU        # opt-in au boot via rcu_nocbs=
+# SCHED_AUTOGROUP est une fonctionnalité desktop (groupement par session tty)
+# qui fausse l'équité entre conteneurs et VM sur un serveur.
+cfg --disable SCHED_AUTOGROUP
+
+# ============================================================
+# Robustesse au boot et au reboot
+# ============================================================
+# Cause n°1 des reboots spontanés "sur certaines machines": un watchdog
+# matériel armé par le BIOS que personne ne nourrit. WATCHDOG_HANDLE_BOOT_ENABLED
+# fait nourrir le chien par le noyau jusqu'à ce que l'espace utilisateur prenne
+# le relais, au lieu de laisser la machine redémarrer toute seule.
+cfg --enable WATCHDOG
+cfg --enable WATCHDOG_HANDLE_BOOT_ENABLED
+cfg --module ITCO_WDT            # Intel TCO (chipsets Intel)
+cfg --module SP5100_TCO          # AMD SP5100/FCH
+cfg --module IT87_WDT
+cfg --module W83627HF_WDT
+cfg --module IPMI_WATCHDOG
+
+# Suspend/hibernation: inutile sur un serveur et source d'une classe entière
+# de bugs ACPI/S3 au retour d'un cycle d'alimentation.
+cfg --disable SUSPEND
+cfg --disable HIBERNATION
+
+# Entropie: sans confiance au RDRAND/bootloader, getrandom() peut bloquer
+# plusieurs minutes au démarrage sur du matériel ancien.
+cfg --enable RANDOM_TRUST_CPU
+cfg --enable RANDOM_TRUST_BOOTLOADER
+
+# Détecter et TRACER au lieu de redémarrer en silence.
+cfg --enable LOCKUP_DETECTOR
+cfg --enable SOFTLOCKUP_DETECTOR
+cfg --enable HARDLOCKUP_DETECTOR
+cfg --enable DETECT_HUNG_TASK
+cfg --disable BOOTPARAM_SOFTLOCKUP_PANIC
+cfg --disable BOOTPARAM_HUNG_TASK_PANIC
+
+# kdump: capture réelle de la panic (paquet kdump-tools côté hôte).
+cfg --enable KEXEC
+cfg --enable KEXEC_FILE
+cfg --enable CRASH_DUMP
+
+# EFI et variables EFI (efibootmgr, GRUB, systemd).
+cfg --enable EFI
+cfg --enable EFI_STUB
+cfg --enable EFI_VARS_PSTORE
+cfg --enable EFIVAR_FS
+cfg --enable ACPI
+cfg --enable ACPI_TABLE_UPGRADE
+
+# ============================================================
+# Mémoire et diagnostic matériel
+# ============================================================
+# Le noyau n'a AUCUNE option liée au type de DRAM (DDR2/DDR3/...): c'est le
+# firmware qui initialise le contrôleur. Ce qui compte réellement sur du
+# matériel ancien, c'est de DÉTECTER les erreurs mémoire: des barrettes
+# DDR2/DDR3 de 12-15 ans qui se dégradent produisent exactement des "reboots
+# aléatoires sur certaines machines", et sans pilote EDAC l'erreur n'est
+# jamais rapportée.
+cfg --enable EDAC
+cfg --module EDAC_AMD64          # AMD K8 -> Zen
+cfg --module EDAC_I3000
+cfg --module EDAC_I3200
+cfg --module EDAC_I5000
+cfg --module EDAC_I5100
+cfg --module EDAC_I7300_MC
+cfg --module EDAC_I7CORE
+cfg --module EDAC_IE31200
+cfg --module EDAC_SBRIDGE
+cfg --module EDAC_SKX
+cfg --module EDAC_I10NM
+
+# Machine Check + RAS + erreurs firmware: savoir POURQUOI la machine est tombée.
+cfg --enable X86_MCE
+cfg --enable X86_MCE_INTEL
+cfg --enable X86_MCE_AMD
+cfg --enable RAS
+cfg --enable ACPI_APEI
+cfg --enable ACPI_APEI_GHES
+cfg --enable ACPI_APEI_MEMORY_FAILURE
+cfg --enable MEMORY_FAILURE      # reprise sur erreur mémoire au lieu de panic
+
+# Hôtes à faible RAM (une machine d'époque DDR2 a 2 à 8 Go).
+cfg --enable ZSWAP
+cfg --enable ZSWAP_COMPRESSOR_DEFAULT_ZSTD
+cfg --enable ZSMALLOC
+cfg --module ZRAM
+cfg --enable COMPACTION
+
+# THP en madvise, PAS en always.
+# Sur un hôte KVM à mémoire contrainte, THP=always provoque des pics de latence
+# à la compaction et entre en conflit avec KSM. QEMU demande explicitement les
+# hugepages quand il en veut: rien n'est perdu.
+cfg --enable TRANSPARENT_HUGEPAGE_MADVISE
+cfg --disable TRANSPARENT_HUGEPAGE_ALWAYS
+
+cfg --enable SPARSEMEM_VMEMMAP
+cfg --enable MEMORY_HOTPLUG
+cfg --enable MEMORY_HOTREMOVE
+
+# Supervision matérielle: IPMI et capteurs, sur 12 ans de générations.
+cfg --enable HWMON
+cfg --module IPMI_HANDLER
+cfg --module IPMI_DEVICE_INTERFACE
+cfg --module IPMI_SI
+cfg --module SENSORS_CORETEMP
+cfg --module SENSORS_K8TEMP
+cfg --module SENSORS_K10TEMP
+cfg --module SENSORS_NCT6775
+cfg --module SENSORS_IT87
+cfg --module SENSORS_W83627HF
+cfg --enable THERMAL
+cfg --module X86_PKG_TEMP_THERMAL
+
+# ============================================================
+# Stockage: contrôleurs serveur sur 12 ans
+# ============================================================
+# AHCI et NVMe en built-in: la racine monte sans dépendre de l'initramfs.
+cfg --enable ATA
+cfg --enable SATA_AHCI
+cfg --enable ATA_PIIX
+cfg --module MEGARAID_SAS
+cfg --module SCSI_MPT3SAS
+cfg --module SCSI_HPSA
+cfg --module SCSI_SMARTPQI
+cfg --module SCSI_AACRAID
+cfg --module SCSI_ARCMSR
+
+# ============================================================
+# Allègement: retirer ce qu'un hyperviseur headless n'utilise jamais
+# ============================================================
+cfg --disable SOUND
+cfg --disable MEDIA_SUPPORT      # DVB, webcams, tuners
+cfg --set-str EXTRA_FIRMWARE ""
+
+# ============================================================
+# Mitigations spéculatives: compilées ET actives par défaut
+# ============================================================
+# Sur un hôte KVM multi-locataires, les désactiver autorise une fuite de
+# données ENTRE VM. Le coût est réel sur du Haswell/Bulldozer (-15 à -35 %),
+# et l'admin garde 'mitigations=off' au boot pour un hôte à charge unique et
+# de confiance. C'est un choix d'exploitation, pas un choix de build.
+cfg --enable CPU_MITIGATIONS
+cfg --enable MITIGATION_PAGE_TABLE_ISOLATION
+cfg --enable MITIGATION_RETPOLINE
+cfg --enable MITIGATION_SPECTRE_V1
+cfg --enable MITIGATION_SPECTRE_V2
+cfg --enable MITIGATION_SPECTRE_BHI
+cfg --enable MITIGATION_RETHUNK
+cfg --enable MITIGATION_SRSO
+cfg --enable MITIGATION_RETBLEED
+cfg --enable MITIGATION_MDS
+cfg --enable MITIGATION_TAA
+cfg --enable MITIGATION_MMIO_STALE_DATA
+cfg --enable MITIGATION_L1TF
+cfg --enable MITIGATION_GDS
+cfg --enable MITIGATION_RFDS
+cfg --enable MITIGATION_SRBDS
+cfg --enable MITIGATION_SSB
+cfg --enable MITIGATION_ITS
+cfg --enable MITIGATION_TSA
+cfg --enable MITIGATION_VMSCAPE
 
 else
 
@@ -1363,6 +1795,76 @@ make "${MAKE_ARCH_ARGS[@]}" olddefconfig
 echo
 echo "[6/9] Vérification de la config finale..."
 
+# ============================================================
+# [6a] Vérification des options RÉELLEMENT demandées
+# ============================================================
+# Sans ce contrôle, un cfg() sur un symbole renommé ou supprimé upstream est un
+# no-op silencieux: scripts/config écrit la ligne, olddefconfig la retire, et
+# rien ne le signale. Cette version applique ~200 options; l'ancien "|| true"
+# n'était plus tenable.
+#
+# Deux verdicts distincts:
+#   INCONNU  -> le symbole n'existe pas dans CE noyau (renommé/supprimé).
+#               Erreur bloquante: l'intention exprimée n'a rien produit.
+#   IGNORÉ   -> le symbole existe mais olddefconfig ne l'a pas retenu, presque
+#               toujours parce qu'une dépendance manque. Avertissement détaillé.
+echo "Indexation des symboles Kconfig de ${KERNEL_VERSION}..."
+KCONFIG_SYMBOLS="${BUILD_ROOT}/kconfig-symbols-${KERNEL_VERSION}.txt"
+find . -type f -name 'Kconfig*' -print0 \
+  | xargs -0 grep -hoE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' \
+  | awk '{print $NF}' | sort -u > "$KCONFIG_SYMBOLS"
+echo "  $(wc -l < "$KCONFIG_SYMBOLS") symboles connus, ${#CFG_REQUESTS[@]} options demandées."
+
+cfg_unknown=()
+cfg_ignored=()
+for req in "${CFG_REQUESTS[@]}"; do
+  IFS=$'\t' read -r _sym _action _expect <<<"$req"
+
+  if ! grep -qxF "$_sym" "$KCONFIG_SYMBOLS"; then
+    cfg_unknown+=("${_sym} (${_action})")
+    continue
+  fi
+
+  case "$_expect" in
+    y|m)
+      grep -q "^CONFIG_${_sym}=${_expect}\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=${_expect} obtenu=$(cfg_actual "$_sym")")
+      ;;
+    n)
+      grep -q "^CONFIG_${_sym}=[ym]\$" .config \
+        && cfg_ignored+=("${_sym}: demandé=n obtenu=$(cfg_actual "$_sym")")
+      ;;
+    str:*)
+      _want="${_expect#str:}"
+      grep -q "^CONFIG_${_sym}=\"${_want}\"\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=\"${_want}\" obtenu=$(cfg_actual "$_sym")")
+      ;;
+    val:*)
+      _want="${_expect#val:}"
+      grep -q "^CONFIG_${_sym}=${_want}\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=${_want} obtenu=$(cfg_actual "$_sym")")
+      ;;
+  esac
+done
+
+if (( ${#cfg_ignored[@]} > 0 )); then
+  echo
+  echo "AVERTISSEMENT: ${#cfg_ignored[@]} option(s) demandée(s) non retenue(s) par olddefconfig"
+  echo "  (symbole existant mais dépendance manquante, ou valeur forcée):"
+  printf '  - %s\n' "${cfg_ignored[@]}"
+fi
+
+if (( ${#cfg_unknown[@]} > 0 )); then
+  echo
+  echo "Symboles INCONNUS dans Linux ${KERNEL_VERSION}:"
+  printf '  - %s\n' "${cfg_unknown[@]}"
+  die "${#cfg_unknown[@]} symbole(s) Kconfig inexistant(s) dans ce noyau.
+Ils ont été renommés ou supprimés upstream: le cfg() correspondant n'a RIEN fait.
+Corrige les noms dans la section de configuration avant de compiler."
+fi
+
+echo "Toutes les options demandées existent dans Linux ${KERNEL_VERSION}."
+
 opt_on() { grep -q "^CONFIG_${1}=[ym]" .config; }
 
 if [[ "$PROFILE" == "virtua" ]]; then
@@ -1371,17 +1873,54 @@ if [[ "$PROFILE" == "virtua" ]]; then
     KVM VIRTIO VIRTIO_PCI VHOST_NET
     NAMESPACES USER_NS NET_NS PID_NS
     CGROUPS CGROUP_SCHED MEMCG BLK_CGROUP OVERLAY_FS SECCOMP
-    BRIDGE VETH TUN EXT4_FS
+    BRIDGE VETH TUN
     RFKILL CFG80211 MAC80211 BT
+    # Racines supportées: le parc est mixte ext4 / BTRFS, les DEUX doivent
+    # être built-in sous peine d'un hôte qui ne remonte pas après upgrade.
+    EXT4_FS BTRFS_FS
+    # Console: sans ça la machine boote mais reste écran noir, ce qui est
+    # systématiquement rapporté comme une instabilité au reboot.
+    VT FRAMEBUFFER_CONSOLE DRM_SIMPLEDRM
+    # Entrée console et console série: seuls moyens d'intervenir/diagnostiquer.
+    HID_GENERIC USB_HID SERIAL_8250_CONSOLE
+    # Anti-reboot spontané.
+    WATCHDOG_HANDLE_BOOT_ENABLED
+    # Plateforme CPU 12 ans et plus.
+    MICROCODE X86_ACPI_CPUFREQ
+    # Modules hors-arbre (ZFS DKMS): sans MODVERSIONS le DKMS casse.
+    MODVERSIONS
+    # eBPF CO-RE.
+    BPF_SYSCALL DEBUG_INFO_BTF
+    # Prérequis systemd non négociables.
+    FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL TMPFS_XATTR
   )
 
   # Fortement souhaitées, on avertit seulement.
   RECOMMENDED=(
     KVM_INTEL KVM_AMD VFIO_PCI IOMMU_SUPPORT IOMMUFD VFIO_DEVICE_CDEV
     VIRTIO_NET VIRTIO_BLK VIRTIO_FS VIRTIO_MEM VHOST_VSOCK VHOST_IOTLB MACVTAP
-    NF_TABLES NF_NAT IP_NF_TARGET_MASQUERADE
+    KVM_SMM KVM_AMD_SEV PARAVIRT PARAVIRT_SPINLOCKS VDPA
+    NF_TABLES NF_NAT IP_NF_TARGET_MASQUERADE WIREGUARD IP_VS
     CGROUP_CPUACCT CGROUP_HUGETLB CFS_BANDWIDTH PSI CHECKPOINT_RESTORE
-    SECURITY_APPARMOR BTRFS_FS XFS_FS KSM TRANSPARENT_HUGEPAGE HUGETLBFS
+    CGROUP_MISC CGROUP_WRITEBACK BLK_DEV_THROTTLING
+    SECURITY_APPARMOR SECURITY_LANDLOCK
+    XFS_FS KSM TRANSPARENT_HUGEPAGE HUGETLBFS BTRFS_FS_POSIX_ACL
+    # Console serveur / BMC.
+    DRM_AST DRM_MGAG200
+    # Fréquence: la couverture 12 ans dépend d'avoir PLUSIEURS drivers.
+    X86_POWERNOW_K8 X86_INTEL_PSTATE X86_AMD_PSTATE CPU_FREQ_GOV_SCHEDUTIL
+    # Diagnostic matériel et mémoire.
+    EDAC EDAC_AMD64 EDAC_SBRIDGE X86_MCE RAS ACPI_APEI_GHES MEMORY_FAILURE
+    # Watchdogs concrets.
+    ITCO_WDT SP5100_TCO IPMI_WATCHDOG IPMI_SI
+    # Mémoire contrainte.
+    ZSWAP ZRAM
+    # Diagnostic de panic.
+    KEXEC CRASH_DUMP DETECT_HUNG_TASK SOFTLOCKUP_DETECTOR
+    # Stockage serveur.
+    SATA_AHCI MEGARAID_SAS SCSI_MPT3SAS
+    # Mitigations (posture: actives par défaut).
+    CPU_MITIGATIONS MITIGATION_RETPOLINE MITIGATION_SPECTRE_V2
   )
 elif [[ "$PROFILE" == "desktop" ]]; then
   # Desktop: le minimum attendu est de booter correctement en bare metal ou VM.
@@ -1428,6 +1967,16 @@ done
 Vérifie le .config et les dépendances. Build interrompu."
 
 echo "Config OK — toutes les options critiques sont présentes."
+
+if [[ "$CONFIG_ONLY" == "1" ]]; then
+  echo
+  echo "============================================================"
+  echo " Build à blanc (CONFIG_ONLY=1): arrêt avant compilation."
+  echo " Config vérifiée : ${SOURCE_DIR}/.config"
+  echo " Release visée   : ${KERNEL_VERSION}${LOCAL_VERSION}"
+  echo "============================================================"
+  exit 0
+fi
 
 # ============================================================
 # [7/9] Compilation
