@@ -966,6 +966,9 @@ echo "[3/9] Récupération du source kernel (source=${SOURCE})..."
 
 sudo mkdir -p "$BUILD_ROOT" "$OUTPUT_DIR"
 sudo chown -R "$(id -un):$(id -gn)" "$BUILD_ROOT"
+# OUTPUT_DIR hors de BUILD_ROOT (ex: OUTPUT_DIR=~/out-7.2.11) restait à root:
+# la copie finale des .deb échouait après ~5h de compilation.
+sudo chown "$(id -un):$(id -gn)" "$OUTPUT_DIR"
 cd "$BUILD_ROOT"
 
 if [[ "$SOURCE" == "debian" ]]; then
