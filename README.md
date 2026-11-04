@@ -70,12 +70,12 @@ A production host enables only the `kernel` suite, so it can never be offered a
 DEV kernel — the two channels do not share a package name.
 
 ```bash
-# Production (ligne 7.2, branche git prod/7.2)
-./build-virtua-kernel.sh KERNEL_VERSION=7.2.4
-sudo GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virtua-kernel
+# Production (ligne 7.3, branche git prod/7.3, sans ZFS: voir la fenêtre OpenZFS)
+./build-virtua-kernel.sh KERNEL_VERSION=7.3.1 no-zfs
+sudo ZFS_META_DEP=none GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virtua-kernel
 
-# Test / DEV (ligne 7.3, branche git main)
-./build-virtua-kernel.sh track=dev KERNEL_VERSION=7.3.0
+# Test / DEV (ligne 7.4, branche git main)
+./build-virtua-kernel.sh track=dev KERNEL_VERSION=7.4.0
 sudo RELEASE_TRACK=dev GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virtua-kernel-dev
 ```
 
@@ -83,11 +83,12 @@ sudo RELEASE_TRACK=dev GPG_KEY=repo@auxinux.ca ./build-depot-kernel.sh /tmp/virt
 
 | Ligne kernel | Branche git | Track | Statut |
 |---|---|---|---|
-| 7.2.x | `prod/7.2` | `prod` | ligne de production courante |
-| 7.3.x | `main` | `dev` | ligne de développement |
+| 7.3.x | `prod/7.3` | `prod` | ligne de production courante |
+| 7.2.x | `prod/7.2` | `prod` | ancienne ligne (fin de vie upstream) |
+| 7.4.x | `main` | `dev` | ligne de développement |
 
 Les correctifs de config validés en production remontent par cherry-pick
-`prod/7.2` -> `main`, jamais l'inverse en masse.
+`prod/7.3` -> `main`, jamais l'inverse en masse.
 
 ### Build à blanc
 
@@ -150,3 +151,9 @@ comparé comme `7.2`, donc couvert par OpenZFS 2.4.4.
 The default is OpenZFS 2.4.4, which covers the 7.1 and 7.2 kernel series. When
 bumping `ZFS_VERSION`, also pin the matching `ZFS_SHA256` (from the GPG-signed
 `zfs-<version>.sha256.asc` published with the release).
+
+La ligne 7.3 est publiée **sans ZFS** (`no-zfs`, `ZFS_META_DEP=none`) : aucune
+version d'OpenZFS sortie ne couvre encore cette série. Sur un hôte où
+`openzfs-zfs-dkms` 2.4.4 est installé, le build DKMS échoue pour la 7.3 sans faire
+échouer `apt`, et le module `zfs` est absent au démarrage sur ce kernel. Un hôte
+qui dépend de ZFS doit rester en 7.2 tant qu'OpenZFS ne couvre pas la 7.3.
